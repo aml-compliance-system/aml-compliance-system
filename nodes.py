@@ -5,6 +5,9 @@ import xgboost as xgb
 import pandas as pd
 import os
 
+import uuid
+# Import the function from your LLM.py file
+from LLM import generate_report
 
 
 def preprocessing_node(state: dict) -> dict:
@@ -290,36 +293,60 @@ def llm_api_node(state: dict) -> dict:
         return {"sar_reports": []}
 
     print(f"--- CALLING LLM TO GENERATE {len(alerts)} SAR(s) ---")
+
+    alerts = sorted(alerts, key=lambda x: x.get('final_risk_score', 0), reverse=True)
     
     for alert in alerts:
-        # 1. Structure the prompt with the exact data points from the ETL and Model nodes
-        prompt = f"""
-        Generate a Suspicious Activity Report (SAR) narrative for the following transaction:
-        - Originating Account: {alert['Account']}
-        - Counterparty: {alert['Account_duplicated_0']}
-        - Amount: ${alert['Amount Paid']:.2f}
-        - Payment Format: {alert['Payment Format']}
-        - Aggregate Risk Score: {alert['final_risk_score']:.2f}
-
-        Please provide a concise, professional summary for a compliance investigator.
-        """
-        
-        # 2. Execute the LLM Call 
-        # (Placeholder: Replace this string with actual response = llm.invoke(prompt))
-        generated_text = (
-            f"CONFIDENTIAL SAR DRAFT: Account {alert['Account']} has been flagged for a highly suspicious "
-            f"{alert['Payment Format']} transfer of ${alert['Amount Paid']:.2f} to {alert['Account_duplicated_0']}. "
-            f"The autonomous risk engine assigned a critical severity score of {alert['final_risk_score']:.2f} due to "
-            f"anomalous network topology and behavioral drift. Recommend immediate asset freeze and investigator review."
-        )
-        
+        # 1. Structure the payload to match the exact schema expected by LLM.py
+        structured_case = {
+            "case_id": f"CASE-{uuid.uuid4().hex[:8].upper()}",
+            "customer": {
+                "customer_id": alert['Account'],
+                "name_masked": "Redacted Entity",
+                "segment": "Transaction Monitoring Batch"
+            },
+            "risk_score": round(alert['final_risk_score'], 2),
+            "risk_tier": alert['risk_label'].upper().replace(" ", "_"), # e.g., "HIGH_RISK"
+            "reason_codes": [
+                {"code": "RC-ML-01", "description": "High autonomous machine learning risk probability"},
+                {"code": "RC-GRAPH-01", "description": "Anomalous network topology or silent mule connection"}
+            ],
+            "model_scores": {
+                "supervised": round(alert['final_risk_score'], 2),
+                "anomaly": 0.0, # Placeholder until anomaly scores are mapped to the alert
+                "behavioral_z": 0.0
+            },
+            "transactions": [
+                {
+                    "timestamp": "Batch Processing",
+                    "from_account": alert['Account'],
+                    "to_account": alert['Account_duplicated_0'],
+                    "amount_sar": alert['Amount Paid'],
+                    "direction": "outbound",
+                    "payment_format": alert['Payment Format']
+                }
+            ]
+        }
+        try:
+            generated_text = generate_report(structured_case)
+        except Exception as e:
+            print(f"⚠️ LLM generation failed for {alert['Account']}: {e}")
+            generated_text = f"SYSTEM ERROR: Failed to generate SAR. API returned: {e}"
+            
         sar_reports.append(generated_text)
 
-    print(f"✅ Successfully generated {len(sar_reports)} SAR drafts.")
-    return {"sar_reports": sar_reports}
+    print(f"✅ Successfully generated {len(sar_reports)} SAR drafts via OpenRouter.")
+    return {
+        "sar_reports": sar_reports, 
+        "final_insights": alerts
+    }
 
 
-# 7. Report Node .
+
+# 7. Report Node
 def report_node(state: dict) -> dict:
     print("--- FINALIZING REPORT ---")
-    return {"final_insights": [{"status": "Completed", "alerts": 1}]}
+    existing_insights = state.get("final_insights", [])    
+    return {
+        "final_insights": existing_insights
+    }

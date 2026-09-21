@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AML Chatbot Workspace</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body class="min-h-screen bg-slate-50 text-slate-800 flex flex-col items-center antialiased relative">
+
+    <header class="w-full max-w-3xl px-4 pt-6 flex justify-between items-center">
+        <a href="index.html" class="inline-flex items-center gap-2 text-sm font-semibold text-slate-500 hover:text-slate-800 transition">
+            <i data-lucide="arrow-left" class="w-4 h-4"></i> Back to Dashboard
+        </a>
+        <span id="activeCaseBadge" class="bg-slate-200 text-slate-700 text-xs font-mono font-bold px-2.5 py-1 rounded-md">
+            Loading...
+        </span>
+    </header>
+
+    <!-- Chat Container -->
+    <main id="chatContainer" class="w-full max-w-3xl px-4 pb-36 pt-8 flex flex-col gap-6"></main>
+
+    <!-- Input Form -->
+    <div class="fixed bottom-0 left-0 right-0 p-4 sm:p-6 bg-gradient-to-t from-slate-50 via-slate-50/90 to-transparent">
+        <form id="chatForm" class="max-w-3xl mx-auto flex items-center gap-2 bg-white border border-slate-200 rounded-2xl shadow-lg p-2 focus-within:ring-2 focus-within:ring-emerald-500">
+            <input
+                id="userInput"
+                type="text"
+                placeholder="Ask a follow-up question about this case..."
+                autocomplete="off"
+                class="flex-1 px-4 py-3 text-slate-800 placeholder-slate-400 bg-transparent text-sm outline-none border-none"
+            >
+            <button
+                type="submit"
+                class="inline-flex items-center justify-center p-3 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl shadow-md transition-all cursor-pointer"
+            >
+                <i data-lucide="send-horizontal" class="w-5 h-5"></i>
+            </button>
+        </form>
+    </div>
+
+    <script>
+        lucide.createIcons();
+        
+        // Retrieve case info from sessionStorage (saved by index.html)
+        const caseId = sessionStorage.getItem('active_case_id') || "UNKNOWN-CASE";
+        const initialReport = sessionStorage.getItem('active_report') || "No report context loaded.";
+
+        // On Page Load
+        document.addEventListener("DOMContentLoaded", () => {
+            const badge = document.getElementById('activeCaseBadge');
+            if (badge) badge.innerText = caseId;
+
+            // Render the initial SAR report as the first AI message in the chat
+            if (initialReport) {
+                appendMessage('ai', `**Initial Generated SAR Report for ${caseId}**\n\n${initialReport}`);
+            }
+        });
+
+        // Handle Chat Submission
+        document.getElementById('chatForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const inputField = document.getElementById('userInput');
+            const message = inputField.value.trim();
+            if (!message) return;
+
+            // 1. Show user message
+            appendMessage('user', message);
+            inputField.value = '';
+
+            // 2. Add loading indicator for AI with a unique ID
+            const loadingId = 'msg-' + Date.now();
+            appendMessage('ai', '<span class="animate-pulse">Analyzing...</span>', loadingId);
+
+            try {
+                // 3. Send to FastAPI
+                const response = await fetch('http://127.0.0.1:8000/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ case_id: caseId, message: message })
+                });
+
+                const data = await response.json();
+                
+                // 4. Replace loading indicator with real markdown parsed response
+                const targetBubble = document.getElementById(loadingId);
+                if (targetBubble) {
+                    const contentDiv = targetBubble.querySelector('.chat-text-content');
+                    if (contentDiv) {
+                        contentDiv.innerHTML = marked.parse(data.response);
+                    }
+                }
+                
+            } catch (error) {
+                const targetBubble = document.getElementById(loadingId);
+                if (targetBubble) {
+                    const contentDiv = targetBubble.querySelector('.chat-text-content');
+                    if (contentDiv) {
+                        contentDiv.innerText = "⚠️ Error connecting to server.";
+                    }
+                }
+            }
+        });
+
+        // Helper: Create Chat Bubbles
+        // Helper: Create Chat Bubbles
+function appendMessage(sender, text, customId = null) {
+    const chatContainer = document.getElementById('chatContainer');
+    const messageDiv = document.createElement('div');
+    if (customId) messageDiv.id = customId;
+    
+    if (sender === 'user') {
+        messageDiv.className = "flex justify-end mb-4";
+        messageDiv.innerHTML = `
+            <div class="bg-emerald-600 text-white px-4 py-3 rounded-2xl rounded-tr-none max-w-lg text-sm shadow-sm">
+                <p class="whitespace-pre-wrap">${escapeHtml(text)}</p>
+            </div>
+        `;
+    } else {
+        messageDiv.className = "flex justify-start mb-4";
+        
+        // 👈 FIX: Use marked.parse() so Markdown (**bold**) renders cleanly as actual styling!
+        const renderedContent = text.includes('animate-pulse') ? text : marked.parse(text);
+
+        messageDiv.innerHTML = `
+            <div class="bg-white border border-slate-200 text-slate-800 px-5 py-4 rounded-2xl rounded-tl-none max-w-2xl text-sm shadow-sm space-y-2">
+                <div class="font-bold text-xs uppercase tracking-wider text-emerald-600 mb-1">AML Intelligence AI</div>
+                <div class="chat-text-content leading-relaxed">${renderedContent}</div>
+            </div>
+        `;
+    }
+    
+    chatContainer.appendChild(messageDiv);
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+        // Helper to prevent HTML injection
+        function escapeHtml(unsafe) {
+            return unsafe
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+    </script>

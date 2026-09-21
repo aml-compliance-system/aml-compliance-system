@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AML Risk Cases Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+</head>
+<body class="min-h-screen bg-slate-50 text-slate-800 p-6 md:p-12">
+
+    <div class="max-w-5xl mx-auto space-y-8">
+        <!-- Header -->
+        <div class="flex justify-between items-center border-b border-slate-200 pb-5">
+            <div>
+                <h1 class="text-3xl font-extrabold text-slate-900">AML Risk Cases</h1>
+                <p class="text-sm text-slate-500 mt-1">Run the autonomous risk agent to scan the latest batch.</p>
+            </div>
+            <button 
+                id="runPipelineBtn" 
+                onclick="triggerPipeline()"
+                class="bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold px-4 py-2 rounded-lg transition-all shadow-sm flex items-center gap-2"
+            >
+                <i data-lucide="play" class="w-4 h-4"></i>
+                Run Risk Agent
+            </button>
+        </div>
+
+        <!-- Cases Grid -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6" id="casesGrid">
+            <p id="emptyState" class="text-slate-400 text-sm italic col-span-full">Click "Run Risk Agent" to process transactions...</p>
+        </div>
+    </div>
+
+    <script>
+        lucide.createIcons();
+
+        async function triggerPipeline() {
+            const btn = document.getElementById('runPipelineBtn');
+            const grid = document.getElementById('casesGrid');
+            
+            // UI Loading State
+            btn.innerHTML = `<i data-lucide="loader-2" class="w-4 h-4 animate-spin"></i> Processing...`;
+            btn.disabled = true;
+            grid.innerHTML = '';
+            lucide.createIcons();
+
+            try {
+                // Call FastAPI Backend
+                const response = await fetch('http://127.0.0.1:8000/pipeline/analyze', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ csv_path: "input/unlabeled_transactions.csv" })
+                });
+                
+                const data = await response.json();
+                
+                if (data.high_risk_alerts_found === 0) {
+                    grid.innerHTML = `<p class="text-emerald-600 font-medium col-span-full">✅ Pipeline finished safely. No high-risk transactions detected.</p>`;
+                } else {
+                    // Render Cards dynamically
+                    window.caseDatabase = {}; 
+
+                    data.case_data.forEach((alert, index) => {
+                        const accountId = alert.Account || alert.account || "Unknown Entity";
+                        const counterparty = alert.Account_duplicated_0 || alert.account_duplicated_0 || "Unknown Counterparty";
+                        const safeAmount = Number(alert['Amount Paid'] || alert['amount paid'] || 0).toLocaleString();
+                        const safeScore = Number(alert.final_risk_score || 0).toFixed(2);
+                        const riskLabel = alert.risk_label || 'HIGH RISK';
+                        const reportText = data.reports[index] || "Notice: SAR generation was throttled.";
+
+                        // Save to global lookup
+                        window.caseDatabase[accountId] = { alert, report: reportText };
+
+                        const card = document.createElement('div');
+                        card.className = "bg-white rounded-2xl border border-slate-200 p-6 shadow-sm hover:shadow-md transition";
+                        card.innerHTML = `
+                            <div class="flex justify-between items-start mb-4">
+                                <div>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-slate-400">Account Flagged</span>
+                                    <h2 class="text-xl font-bold text-slate-800">${accountId}</h2>
+                                </div>
+                                <span class="bg-red-100 text-red-700 font-bold text-xs px-2.5 py-1 rounded-md uppercase">${riskLabel}</span>
+                            </div>
+                            <div class="space-y-2 text-sm text-slate-600 mb-6">
+                                <p><strong class="text-slate-800">Counterparty:</strong> ${counterparty}</p>
+                                <p><strong class="text-slate-800">Amount:</strong> $${safeAmount}</p>
+                                <p><strong class="text-slate-800">Final Risk Score:</strong> ${safeScore} / 1.0</p>
+                            </div>
+                            <button 
+                                onclick="launchInvestigation('${accountId}')"
+                                class="w-full flex items-center justify-center gap-2 bg-emerald-500 hover:bg-emerald-600 text-white font-medium py-2.5 px-4 rounded-xl transition cursor-pointer"
+                            >
+                                <span>Investigate with AI</span>
+                            </button>
+                        `;
+                        grid.appendChild(card);
+                    });
+
+                    window.launchInvestigation = function(accId) {
+                        const caseData = window.caseDatabase[accId];
+                        sessionStorage.setItem('active_case_id', accId);
+                        sessionStorage.setItem('active_report', caseData.report);
+                        window.location.href = 'chat.html';
+                    };
+
+
+                    lucide.createIcons();
+                }
+            } catch (error) {
+                grid.innerHTML = `<p class="text-red-500 text-sm col-span-full">⚠️ Error connecting to FastAPI: ${error.message}</p>`;
+            }
+
+            // Reset UI
+            btn.innerHTML = `<i data-lucide="play" class="w-4 h-4"></i> Run Risk Agent`;
+            btn.disabled = false;
+            lucide.createIcons();
+        }
+
+        function openChat(caseId, encodedReport) {
+            localStorage.setItem('selectedCaseId', caseId);
+            localStorage.setItem('selectedCaseReport', decodeURIComponent(encodedReport));
+            window.location.href = 'chat.html';
+        }
+    </script>
+</body>
+</html>
