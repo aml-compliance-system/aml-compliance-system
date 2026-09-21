@@ -181,14 +181,284 @@ def run_anomaly_model(state: dict) -> dict:
     return {"ml_probabilities": {"anomaly_score": anomaly_scores}}
 
 
+
 def run_behavioral_model(state: dict) -> dict:
-    print("--- RUNNING BEHAVIORAL MODEL ---")
-    df = state["cleaned_df"]
-    behavioral_scores = [0.0] * len(df)
-    return {"ml_probabilities": {"behavioral_score": behavioral_scores}}
+    print("--- RUNNING BEHAVIORAL RISK MODEL ---")
 
+    import numpy as np
+    import pandas as pd
 
+    df = state["cleaned_df"].copy()
 
+    # -------------------------------------------------
+    # 1. Required behavioral features
+    # -------------------------------------------------
+    required = [
+        "Amount Paid",
+        "amount_vs_prev_max_ratio",
+        "transaction_frequency_ratio",
+        "outgoing_count_24h",
+        "outgoing_count_72h",
+    ]
+
+    missing = [
+        col for col in required
+        if col not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "Behavioral model missing required features: "
+            f"{missing}"
+        )
+
+    def numeric(col):
+        return (
+            pd.to_numeric(df[col], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+        )
+
+    # -------------------------------------------------
+    # 2. Customer baseline drift: transaction amount
+    #
+    # ratio <= 1  -> no positive drift
+    # ratio > 1   -> increasingly unusual vs previous max
+    # -------------------------------------------------
+    amount_ratio = numeric(
+        "amount_vs_prev_max_ratio"
+    )
+
+    amount_excess = (
+        amount_ratio - 1.0
+    ).clip(lower=0.0)
+
+    amount_drift_score = (
+        1.0 - np.exp(-amount_excess)
+    )
+
+    amount_drift_score = (
+        amount_drift_score
+        .where(amount_ratio > 0, 0.0)
+        .fillna(0.0)
+        .clip(0.0, 1.0)
+    )
+
+    # -------------------------------------------------
+    # 3. Customer baseline drift: transaction frequency
+    # -------------------------------------------------
+    frequency_ratio = numeric(
+        "transaction_frequency_ratio"
+    )
+
+    frequency_excess = (
+        frequency_ratio - 1.0
+    ).clip(lower=0.0)
+
+    frequency_drift_score = (
+        1.0 - np.exp(-frequency_excess)
+    )
+
+    frequency_drift_score = (
+        frequency_drift_score
+        .where(frequency_ratio > 0, 0.0)
+        .fillna(0.0)
+        .clip(0.0, 1.0)
+    )
+
+    # -------------------------------------------------
+    # 4. Peer-group comparison
+    #
+    # Compare log transaction amount with peers using
+    # median + MAD (robust to extreme outliers).
+    #
+    # Payment Format is used as the peer group when
+    # available. Otherwise use the whole batch.
+    # -------------------------------------------------
+    amount_paid = (
+        numeric("Amount Paid")
+        .fillna(0.0)
+        .clip(lower=0.0)
+    )
+
+    log_amount = np.log1p(amount_paid)
+
+    if "Payment Format" in df.columns:
+        peer_group = (
+            df["Payment Format"]
+            .fillna("UNKNOWN")
+            .astype(str)
+        )
+    else:
+        peer_group = pd.Series(
+            "GLOBAL",
+            index=df.index
+        )
+
+    peer_df = pd.DataFrame({
+        "group": peer_group,
+        "value": log_amount
+    })
+
+    group_size = (
+        peer_df
+        .groupby("group")["value"]
+        .transform("size")
+    )
+
+    group_median = (
+        peer_df
+        .groupby("group")["value"]
+        .transform("median")
+    )
+
+    abs_dev = (
+        peer_df["value"] - group_median
+    ).abs()
+
+    group_mad = (
+        abs_dev
+        .groupby(peer_df["group"])
+        .transform("median")
+    )
+
+    # Global fallback for small peer groups
+    global_median = float(
+        np.nanmedian(log_amount)
+    )
+
+    global_mad = float(
+        np.nanmedian(
+            np.abs(log_amount - global_median)
+        )
+    )
+
+    global_scale = max(
+        1.4826 * global_mad,
+        1e-6
+    )
+
+    use_global = (
+        (group_size < 20)
+        | (group_mad <= 1e-9)
+        | group_mad.isna()
+    )
+
+    center = group_median.where(
+        ~use_global,
+        global_median
+    )
+
+    scale = (
+        1.4826 * group_mad
+    ).where(
+        ~use_global,
+        global_scale
+    )
+
+    robust_z = (
+        (log_amount - center) / scale
+    ).clip(lower=0.0)
+
+    # 5 robust standard deviations -> score 1
+    peer_score = (
+        robust_z / 5.0
+    ).clip(0.0, 1.0).fillna(0.0)
+
+    # -------------------------------------------------
+    # 5. Rolling velocity acceleration
+    #
+    # Uniform activity over 72h:
+    # ~ 1/3 of transactions should fall in last 24h.
+    #
+    # Concentration toward the last 24h increases score.
+    # -------------------------------------------------
+    count_24h = (
+        numeric("outgoing_count_24h")
+        .fillna(0.0)
+        .clip(lower=0.0)
+    )
+
+    count_72h = (
+        numeric("outgoing_count_72h")
+        .fillna(0.0)
+        .clip(lower=0.0)
+    )
+
+    recent_share = (
+        count_24h
+        / count_72h.replace(0, np.nan)
+    )
+
+    velocity_score = (
+        (recent_share - (1.0 / 3.0))
+        / (2.0 / 3.0)
+    ).clip(0.0, 1.0).fillna(0.0)
+
+    # -------------------------------------------------
+    # 6. Weighted behavioral risk score
+    # -------------------------------------------------
+    behavioral_scores = (
+        0.30 * amount_drift_score
+        + 0.30 * frequency_drift_score
+        + 0.20 * peer_score
+        + 0.20 * velocity_score
+    )
+
+    behavioral_scores = np.clip(
+        behavioral_scores.to_numpy(
+            dtype=np.float32
+        ),
+        0.0,
+        1.0
+    )
+
+    # -------------------------------------------------
+    # 7. Validation
+    # -------------------------------------------------
+    if len(behavioral_scores) != len(df):
+        raise RuntimeError(
+            "Behavioral score count does not match "
+            "transaction count."
+        )
+
+    if not np.isfinite(
+        behavioral_scores
+    ).all():
+        raise RuntimeError(
+            "Behavioral model produced invalid scores."
+        )
+
+    print(
+        f"✅ Behavioral model scored "
+        f"{len(behavioral_scores):,} transactions."
+    )
+
+    print(
+        "✅ Behavioral score range:",
+        round(float(behavioral_scores.min()), 4),
+        "→",
+        round(float(behavioral_scores.max()), 4)
+    )
+
+    print(
+        "✅ Mean behavioral score:",
+        round(float(behavioral_scores.mean()), 4)
+    )
+
+    print(
+        "Component means | "
+        f"amount drift={amount_drift_score.mean():.3f}, "
+        f"frequency drift={frequency_drift_score.mean():.3f}, "
+        f"peer={peer_score.mean():.3f}, "
+        f"velocity={velocity_score.mean():.3f}"
+    )
+
+    return {
+        "ml_probabilities": {
+            "behavioral_score":
+                behavioral_scores.tolist()
+        }
+    }
 
 
 # 4. Graph Context Node (cuGraph)
