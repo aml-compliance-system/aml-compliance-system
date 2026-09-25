@@ -174,7 +174,7 @@ def main():
                 "--date",
                 run_date,
             ],
-            cwd="/content/aml-compliance-system",
+            cwd=str(REPO_ROOT),
         )
 
         if result.returncode != 0:
