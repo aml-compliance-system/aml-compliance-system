@@ -19,3 +19,11 @@ outputs/
 
 # Temporary daily files
 .tmp/
+
+
+
+Data/
+.venv/
+__pycache__/
+*.parquet
+*.pyc

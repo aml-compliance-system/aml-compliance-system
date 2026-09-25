@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import json
 from openai import OpenAI
+import ollama
 from LangGraph import app as langgraph_app
 
 app = FastAPI()
@@ -61,25 +62,34 @@ class ChatRequest(BaseModel):
     case_id: str
     message: str
 
+import json
+import pandas as pd
+
 @app.post("/chat")
 def chat_with_case(request: ChatRequest):
     try:
         case_info = CASE_CACHE.get(request.case_id)
         
         if not case_info:
-            context_text = f"Target Account ID: {request.case_id} (No telemetry cache found. Re-run pipeline.)"
+            context_text = f"Target Account ID: {request.case_id} (No telemetry cache found.)"
         else:
+            raw_alert = case_info.get('alert', {})
+            essential_keys = [
+                'Account', 'Account_duplicated_0', 'Amount Paid', 'Amount Received',
+                'final_risk_score', 'risk_label', 'base_risk', 'graph_penalty',
+                'is_high_risk_seed', 'received_from_high_risk'
+            ]
+            slim_alert = {k: raw_alert[k] for k in essential_keys if k in raw_alert}
+            alert_json = json.dumps(slim_alert, indent=2, default=str)
+            
             context_text = (
-                f"=== CASE METRICS ===\n{json.dumps(case_info['alert'], indent=2)}\n\n"
-                f"=== INITIAL SAR REPORT ===\n{case_info['report']}"
+                f"=== CASE METRICS ===\n{alert_json}\n\n"
+                f"=== INITIAL SAR REPORT ===\n{case_info.get('report', 'No report available.')}"
             )
 
         system_instruction = (
-            "You are an expert Anti-Money Laundering (AML) Compliance and Financial Crime Investigator. "
-            "Provide thorough, detailed, and analytical responses. "
-            "Strictly base all calculations, counterparty names, transaction amounts (in SAR), and risk scores "
-            "on the provided CASE METRICS and SAR REPORT. Do not hallucinate external details or speculate "
-            "beyond the provided telemetry."
+            "You are an expert Anti-Money Laundering (AML) Compliance Investigator. "
+            "Be direct, concise, and professional. Base answers strictly on the provided case telemetry."
         )
 
         user_content = (
@@ -87,24 +97,28 @@ def chat_with_case(request: ChatRequest):
             f"[INVESTIGATOR QUERY]\n{request.message}"
         )
 
-        completion = client.chat.completions.create(
-            model="qwen2.5:3b-instruct",
+        # Native Ollama call (skips OpenAI proxy overhead entirely)
+        response = ollama.chat(
+            model='qwen2.5',
             messages=[
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": user_content},
+                {'role': 'system', 'content': system_instruction},
+                {'role': 'user', 'content': user_content}
             ],
-            temperature=0.1,  
-            max_tokens=800,  
+            options={'temperature': 0.1, 'num_predict': 400}
         )
+
+        ai_reply = response['message']['content']
 
         return {
             "message": "success",
             "case_id": request.case_id,
-            "response": completion.choices[0].message.content
+            "response": ai_reply
         }
 
     except Exception as e:
+        print(f"❌ CHAT ENDPOINT ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/case/{case_id}")
 def get_case_details(case_id: str):

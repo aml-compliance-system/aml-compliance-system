@@ -11,134 +11,168 @@ import uuid
 from LLM import generate_report
 
 
+
+
+import os
+import pandas as pd
+
 def preprocessing_node(state: dict) -> dict:
     print("--- LOADING FINAL FEATURE DATASET ---")
 
+    # Set the fallback to the EXACT path from your screenshot
     parquet_path = state.get(
         "final_parquet_path",
-        "input/final_transactions_10k.parquet"
+        "Data/processed/sample_1000k.parquet"
     )
+    
+    absolute_path = os.path.abspath(parquet_path)
+    print(f"🔍 DEBUG: Looking for file at: {absolute_path}")
 
-    df = pd.read_parquet(parquet_path)
+    if not os.path.exists(absolute_path):
+        error_msg = f"FILE NOT FOUND: The dataset does not exist at {absolute_path}"
+        print(f"❌ {error_msg}")
+        raise FileNotFoundError(error_msg)
 
-    print(f"✅ Final dataset loaded: {len(df)} transactions.")
-    print(f"✅ Columns loaded: {len(df.columns)}")
+    try:
+        df = pd.read_parquet(absolute_path)
+        print(f"✅ Final dataset loaded: {len(df)} transactions.")
+        print(f"✅ Columns loaded: {len(df.columns)}")
+        return {"final_df": df}
+        
+    except Exception as e:
+        print(f"❌ ERROR reading Parquet file: {str(e)}")
+        raise e
 
-    return {"final_df": df}
 
-
-# This list MUST match the exact order of features used when you trained the model on the A100.
-FEATURE_COLS = [
-    "Amount Received", "Amount Paid", 
-    "sender_out_degree", "sender_in_degree", "sender_unique_counterparties",
-    "receiver_out_degree", "receiver_in_degree", "receiver_unique_counterparties",
-    "sender_receiver_frequency", "bidirectional_relationship",
-    "sender_outgoing_count_so_far_wk", "sender_unique_receivers_so_far_wk",
-    "outgoing_count_24h", "outgoing_sum_24h", "outgoing_count_72h", "outgoing_sum_72h",
-    "sender_total_sent_prev_week", "sender_avg_sent_prev_week",
-    "sender_max_sent_prev_week", "sender_outgoing_count_prev_week",
-    "receiver_total_received_prev_week", "receiver_avg_received_prev_week",
-    "receiver_max_received_prev_week", "receiver_incoming_count_prev_week",
-    "amount_vs_prev_max_diff", "amount_vs_prev_max_ratio",
-    "transaction_frequency_diff", "transaction_frequency_ratio",
-    "hours_since_last_incoming", "outgoing_to_incoming_ratio",
-    "hour_of_day", "currency_mismatch", "same_bank", "payment_format_hash"
-]
 
 def run_xgboost_model(state: dict) -> dict:
-    print("--- RUNNING XGBOOST MODEL ---")
+    try:
+        print("--- RUNNING XGBOOST MODEL ---")
 
-    df = state["final_df"]
+        df = state["final_df"].copy()
 
-    model_path = "models/final_xgboost_aml_model.json"
+        # -------------------------------------------------
+        # 1. Calculate missing features dynamically instead of filling with 0
+        # -------------------------------------------------
+        # Example calculation for hour_of_day from Timestamp if present
+        if 'hour_of_day' not in df.columns and 'Timestamp' in df.columns:
+            df['hour_of_day'] = pd.to_datetime(df['Timestamp']).dt.hour
+        elif 'hour_of_day' not in df.columns:
+            df['hour_of_day'] = 0  # Fallback only if timestamp is completely missing
 
-    # -------------------------------------------------
-    # 1. Validate required features
-    # -------------------------------------------------
-    missing = [
-        col for col in FEATURE_COLS
-        if col not in df.columns
-    ]
+        # Example calculation for currency_mismatch
+        if 'currency_mismatch' not in df.columns and 'Receiving Currency' in df.columns and 'Payment Currency' in df.columns:
+            df['currency_mismatch'] = (df['Receiving Currency'] != df['Payment Currency']).astype(int)
+        elif 'currency_mismatch' not in df.columns:
+            df['currency_mismatch'] = 0
 
-    if missing:
-        raise ValueError(
-            f"XGBoost missing required features: {missing}"
+        # Example calculation for same_bank
+        if 'same_bank' not in df.columns and 'From Bank' in df.columns and 'To Bank' in df.columns:
+            df['same_bank'] = (df['From Bank'] == df['To Bank']).astype(int)
+        elif 'same_bank' not in df.columns:
+            df['same_bank'] = 0
+
+        # Example calculation for payment_format_hash (or fallback mapping)
+        if 'payment_format_hash' not in df.columns and 'Payment Format' in df.columns:
+            df['payment_format_hash'] = df['Payment Format'].astype('category').cat.codes
+        elif 'payment_format_hash' not in df.columns:
+            df['payment_format_hash'] = 0
+
+        # -------------------------------------------------
+        # 2. Exact features expected by the trained XGBoost model
+        # -------------------------------------------------
+        feature_cols = [
+            'Amount Received', 'Amount Paid', 
+            'sender_out_degree', 'sender_in_degree', 'sender_unique_counterparties', 
+            'receiver_out_degree', 'receiver_in_degree', 'receiver_unique_counterparties', 
+            'sender_receiver_frequency', 'bidirectional_relationship', 
+            'sender_outgoing_count_so_far_wk', 'sender_unique_receivers_so_far_wk', 
+            'outgoing_count_24h', 'outgoing_sum_24h', 'outgoing_count_72h', 'outgoing_sum_72h', 
+            'sender_total_sent_prev_week', 'sender_avg_sent_prev_week', 'sender_max_sent_prev_week', 
+            'sender_outgoing_count_prev_week', 'receiver_total_received_prev_week', 
+            'receiver_avg_received_prev_week', 'receiver_max_received_prev_week', 
+            'receiver_incoming_count_prev_week', 'amount_vs_prev_max_diff', 
+            'amount_vs_prev_max_ratio', 'transaction_frequency_diff', 'transaction_frequency_ratio', 
+            'hours_since_last_incoming', 'outgoing_to_incoming_ratio', 
+            'hour_of_day', 'currency_mismatch', 'same_bank', 'payment_format_hash'
+        ]
+
+        model_path = "models/final_xgboost_aml_model.json"
+
+        # -------------------------------------------------
+        # 3. Load trained model
+        # -------------------------------------------------
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"XGBoost model not found: {model_path}"
+            )
+
+        model = xgb.Booster()
+        model.load_model(model_path)
+
+        # -------------------------------------------------
+        # 4. Exact trained feature order and DMatrix setup
+        # -------------------------------------------------
+        X = df[feature_cols].copy()
+
+        dmatrix = xgb.DMatrix(
+            X,
+            feature_names=feature_cols
         )
 
-    # -------------------------------------------------
-    # 2. Load trained model
-    # -------------------------------------------------
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(
-            f"XGBoost model not found: {model_path}"
+        # -------------------------------------------------
+        # 5. Direct probability inference
+        # -------------------------------------------------
+        probabilities = np.asarray(
+            model.predict(dmatrix),
+            dtype=np.float32
         )
 
-    model = xgb.Booster()
-    model.load_model(model_path)
+        if len(probabilities) != len(df):
+            raise ValueError(
+                "XGBoost prediction length mismatch: "
+                f"{len(probabilities)} predictions "
+                f"for {len(df)} transactions."
+            )
 
-    # -------------------------------------------------
-    # 3. Exact trained feature order
-    # -------------------------------------------------
-    X = df[FEATURE_COLS].copy()
+        if not np.isfinite(probabilities).all():
+            raise ValueError(
+                "XGBoost produced non-finite probabilities."
+            )
 
-    dmatrix = xgb.DMatrix(
-        X,
-        feature_names=FEATURE_COLS
-    )
+        if (
+            (probabilities < 0.0).any()
+            or (probabilities > 1.0).any()
+        ):
+            raise ValueError(
+                "binary:logistic XGBoost produced "
+                "probabilities outside [0, 1]."
+            )
 
-    # -------------------------------------------------
-    # 4. Direct probability inference
-    #
-    # Model objective = binary:logistic
-    # Therefore model.predict() already returns
-    # probabilities on the 0-1 scale.
-    #
-    # IMPORTANT:
-    # No batch Min-Max normalization.
-    # -------------------------------------------------
-    probabilities = np.asarray(
-        model.predict(dmatrix),
-        dtype=np.float32
-    )
-
-    if len(probabilities) != len(df):
-        raise ValueError(
-            "XGBoost prediction length mismatch: "
-            f"{len(probabilities)} predictions "
-            f"for {len(df)} transactions."
+        print(
+            "✅ XGBoost scoring complete | "
+            f"rows={len(probabilities):,} | "
+            f"min={probabilities.min():.6f} | "
+            f"mean={probabilities.mean():.6f} | "
+            f"max={probabilities.max():.6f}"
         )
 
-    if not np.isfinite(probabilities).all():
-        raise ValueError(
-            "XGBoost produced non-finite probabilities."
-        )
-
-    if (
-        (probabilities < 0.0).any()
-        or (probabilities > 1.0).any()
-    ):
-        raise ValueError(
-            "binary:logistic XGBoost produced "
-            "probabilities outside [0, 1]."
-        )
-
-    print(
-        "✅ XGBoost scoring complete | "
-        f"rows={len(probabilities):,} | "
-        f"min={probabilities.min():.6f} | "
-        f"mean={probabilities.mean():.6f} | "
-        f"max={probabilities.max():.6f}"
-    )
-
-    return {
-        "ml_probabilities": {
-            "xgb_prob": probabilities.tolist()
+        return {
+            "ml_probabilities": {
+                "xgb_prob": probabilities.tolist()
+            }
         }
-    }
+    except Exception as e:
+        print(f"❌ CRASH TYPE: {type(e).__name__}")
+        print(f"❌ CRASH MESSAGE: {str(e)}")
+        print("❌ FULL TRACEBACK:")
+        traceback.print_exc()
+        raise e
 
-
+    
 # 3. Anomaly Model Node
 def run_anomaly_model(state: dict) -> dict:
+
     print("--- RUNNING AUTOENCODER ANOMALY DETECTION ---")
 
     import os
@@ -146,258 +180,261 @@ def run_anomaly_model(state: dict) -> dict:
     import numpy as np
     import pandas as pd
     import tensorflow as tf
+    try:
+        df = state["final_df"].copy()
 
-    df = state["final_df"].copy()
+        # Portable Autoencoder model directory.
+        # Default: models/autoencoder_final64 inside this repository.
+        # Can optionally be overridden with AUTOENCODER_MODEL_DIR.
+        repo_root = Path(__file__).resolve().parent
 
-    # Portable Autoencoder model directory.
-    # Default: models/autoencoder_final64 inside this repository.
-    # Can optionally be overridden with AUTOENCODER_MODEL_DIR.
-    repo_root = Path(__file__).resolve().parent
-
-    model_dir = Path(
-        os.environ.get(
-            "AUTOENCODER_MODEL_DIR",
-            repo_root / "models" / "autoencoder_final64"
-        )
-    ).expanduser().resolve()
-
-    model_path = (
-        model_dir / "autoencoder_final64.keras"
-    )
-
-    bundle_path = (
-        model_dir /
-        "preprocessing_and_scoring_final64.joblib"
-    )
-
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(
-            f"Autoencoder model not found: {model_path}"
-        )
-
-    if not os.path.exists(bundle_path):
-        raise FileNotFoundError(
-            f"Autoencoder preprocessing bundle not found: {bundle_path}"
-        )
-
-    model = tf.keras.models.load_model(
-        model_path,
-        compile=False
-    )
-
-    bundle = joblib.load(bundle_path)
-
-    # -------------------------------------------------
-    # 1. Validate required raw model features
-    # -------------------------------------------------
-    model_raw_features = bundle["model_raw_features"]
-
-    missing = [
-        col for col in model_raw_features
-        if col not in df.columns
-    ]
-
-    if missing:
-        raise ValueError(
-            "Autoencoder missing required Final dataset features: "
-            f"{missing}"
-        )
-
-    work = df[model_raw_features].copy()
-
-    # -------------------------------------------------
-    # 2. Derived binary features
-    #
-    # IMPORTANT:
-    # These must be calculated BEFORE imputation so that
-    # the original missing-history information is retained.
-    # -------------------------------------------------
-    work["no_previous_incoming"] = (
-        pd.to_numeric(
-            work["hours_since_last_incoming"],
-            errors="coerce"
-        )
-        .isna()
-        .astype("float32")
-    )
-
-    amount_ratio = pd.to_numeric(
-        work["amount_vs_prev_max_ratio"],
-        errors="coerce"
-    )
-
-    frequency_ratio = pd.to_numeric(
-        work["transaction_frequency_ratio"],
-        errors="coerce"
-    )
-
-    work["undefined_history_ratio"] = (
-        amount_ratio.isna() |
-        frequency_ratio.isna()
-    ).astype("float32")
-
-    # -------------------------------------------------
-    # 3. Clean continuous features
-    # -------------------------------------------------
-    continuous_features = bundle["continuous_features"]
-
-    continuous = (
-        work[continuous_features]
-        .apply(pd.to_numeric, errors="coerce")
-        .replace([np.inf, -np.inf], np.nan)
-    )
-
-    # Same trained imputer
-    imputed = bundle["continuous_imputer"].transform(
-        continuous
-    )
-
-    continuous_processed = pd.DataFrame(
-        imputed,
-        columns=continuous_features,
-        index=work.index
-    )
-
-    # -------------------------------------------------
-    # 4. Apply saved clipping limits
-    # -------------------------------------------------
-    clip_lower = bundle["clip_lower"]
-    clip_upper = bundle["clip_upper"]
-
-    for col in continuous_features:
-        continuous_processed[col] = (
-            continuous_processed[col]
-            .clip(
-                lower=clip_lower[col],
-                upper=clip_upper[col]
+        model_dir = Path(
+            os.environ.get(
+                "AUTOENCODER_MODEL_DIR",
+                repo_root / "models" / "autoencoder_final64"
             )
+        ).expanduser().resolve()
+
+        model_path = model_dir / "autoencoder_final64_fixed.keras"
+        bundle_path = (
+            model_dir /
+            "preprocessing_and_scoring_final64.joblib"
         )
 
-    # -------------------------------------------------
-    # 5. Apply trained QuantileTransformer
-    # -------------------------------------------------
-    transformed = bundle["quantile_transformer"].transform(
-        continuous_processed[continuous_features]
-    )
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"Autoencoder model not found: {model_path}"
+            )
 
-    transformed_df = pd.DataFrame(
-        transformed,
-        columns=continuous_features,
-        index=work.index
-    )
+        if not os.path.exists(bundle_path):
+            raise FileNotFoundError(
+                f"Autoencoder preprocessing bundle not found: {bundle_path}"
+            )
 
-    # -------------------------------------------------
-    # 6. Restore binary features
-    # -------------------------------------------------
-    transformed_df["bidirectional_relationship"] = (
-        pd.to_numeric(
-            work["bidirectional_relationship"],
+        model = tf.keras.models.load_model(
+            model_path,
+            compile=False,
+            safe_mode=False
+        )
+        bundle = joblib.load(bundle_path)
+
+        # -------------------------------------------------
+        # 1. Validate required raw model features
+        # -------------------------------------------------
+        model_raw_features = bundle["model_raw_features"]
+
+        missing = [
+            col for col in model_raw_features
+            if col not in df.columns
+        ]
+
+        if missing:
+            raise ValueError(
+                "Autoencoder missing required Final dataset features: "
+                f"{missing}"
+            )
+
+        work = df[model_raw_features].copy()
+
+        # -------------------------------------------------
+        # 2. Derived binary features
+        #
+        # IMPORTANT:
+        # These must be calculated BEFORE imputation so that
+        # the original missing-history information is retained.
+        # -------------------------------------------------
+        work["no_previous_incoming"] = (
+            pd.to_numeric(
+                work["hours_since_last_incoming"],
+                errors="coerce"
+            )
+            .isna()
+            .astype("float32")
+        )
+
+        amount_ratio = pd.to_numeric(
+            work["amount_vs_prev_max_ratio"],
             errors="coerce"
         )
-        .fillna(0.0)
-        .clip(0.0, 1.0)
-        .astype("float32")
-    )
 
-    transformed_df["no_previous_incoming"] = (
-        work["no_previous_incoming"]
-        .astype("float32")
-    )
-
-    transformed_df["undefined_history_ratio"] = (
-        work["undefined_history_ratio"]
-        .astype("float32")
-    )
-
-    # -------------------------------------------------
-    # 7. Exact active feature order expected by Final64
-    # -------------------------------------------------
-    active_features = bundle["active_model_features"]
-
-    X = (
-        transformed_df[active_features]
-        .to_numpy(dtype=np.float32)
-    )
-
-    expected_width = model.input_shape[-1]
-
-    if X.shape[1] != expected_width:
-        raise ValueError(
-            f"Autoencoder expected {expected_width} features "
-            f"but received {X.shape[1]}."
+        frequency_ratio = pd.to_numeric(
+            work["transaction_frequency_ratio"],
+            errors="coerce"
         )
 
-    # -------------------------------------------------
-    # 8. Reconstruction
-    # -------------------------------------------------
-    reconstructed = model.predict(
-        X,
-        batch_size=4096,
-        verbose=0
-    )
+        work["undefined_history_ratio"] = (
+            amount_ratio.isna() |
+            frequency_ratio.isna()
+        ).astype("float32")
 
-    feature_errors = np.square(
-        X - reconstructed
-    )
+        # -------------------------------------------------
+        # 3. Clean continuous features
+        # -------------------------------------------------
+        continuous_features = bundle["continuous_features"]
 
-    # -------------------------------------------------
-    # 9. Convert each feature error to its empirical
-    # percentile using the saved Final64 references
-    # -------------------------------------------------
-    feature_refs = bundle["feature_error_references"]
+        continuous = (
+            work[continuous_features]
+            .apply(pd.to_numeric, errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+        )
 
-    feature_percentiles = np.empty_like(
-        feature_errors,
-        dtype=np.float32
-    )
+        # Same trained imputer
+        imputed = bundle["continuous_imputer"].transform(
+            continuous
+        )
 
-    for j, reference in enumerate(feature_refs):
-        reference = np.asarray(reference)
+        continuous_processed = pd.DataFrame(
+            imputed,
+            columns=continuous_features,
+            index=work.index
+        )
 
-        feature_percentiles[:, j] = (
+        # -------------------------------------------------
+        # 4. Apply saved clipping limits
+        # -------------------------------------------------
+        clip_lower = bundle["clip_lower"]
+        clip_upper = bundle["clip_upper"]
+
+        for col in continuous_features:
+            continuous_processed[col] = (
+                continuous_processed[col]
+                .clip(
+                    lower=clip_lower[col],
+                    upper=clip_upper[col]
+                )
+            )
+
+        # -------------------------------------------------
+        # 5. Apply trained QuantileTransformer
+        # -------------------------------------------------
+        transformed = bundle["quantile_transformer"].transform(
+            continuous_processed[continuous_features]
+        )
+
+        transformed_df = pd.DataFrame(
+            transformed,
+            columns=continuous_features,
+            index=work.index
+        )
+
+        # -------------------------------------------------
+        # 6. Restore binary features
+        # -------------------------------------------------
+        transformed_df["bidirectional_relationship"] = (
+            pd.to_numeric(
+                work["bidirectional_relationship"],
+                errors="coerce"
+            )
+            .fillna(0.0)
+            .clip(0.0, 1.0)
+            .astype("float32")
+        )
+
+        transformed_df["no_previous_incoming"] = (
+            work["no_previous_incoming"]
+            .astype("float32")
+        )
+
+        transformed_df["undefined_history_ratio"] = (
+            work["undefined_history_ratio"]
+            .astype("float32")
+        )
+
+        # -------------------------------------------------
+        # 7. Exact active feature order expected by Final64
+        # -------------------------------------------------
+        active_features = bundle["active_model_features"]
+
+        X = (
+            transformed_df[active_features]
+            .to_numpy(dtype=np.float32)
+        )
+
+        expected_width = model.input_shape[-1]
+
+        if X.shape[1] != expected_width:
+            raise ValueError(
+                f"Autoencoder expected {expected_width} features "
+                f"but received {X.shape[1]}."
+            )
+
+        # -------------------------------------------------
+        # 8. Reconstruction
+        # -------------------------------------------------
+        reconstructed = model.predict(
+            X,
+            batch_size=4096,
+            verbose=0
+        )
+
+        feature_errors = np.square(
+            X - reconstructed
+        )
+
+        # -------------------------------------------------
+        # 9. Convert each feature error to its empirical
+        # percentile using the saved Final64 references
+        # -------------------------------------------------
+        feature_refs = bundle["feature_error_references"]
+
+        feature_percentiles = np.empty_like(
+            feature_errors,
+            dtype=np.float32
+        )
+
+        for j, reference in enumerate(feature_refs):
+            reference = np.asarray(reference)
+
+            feature_percentiles[:, j] = (
+                np.searchsorted(
+                    reference,
+                    feature_errors[:, j],
+                    side="right"
+                )
+                / len(reference)
+            )
+
+        # Final64 selected aggregation method = mean_all
+        transaction_raw_score = (
+            feature_percentiles.mean(axis=1)
+        )
+
+        # -------------------------------------------------
+        # 10. Calibrate against saved transaction reference
+        # -------------------------------------------------
+        transaction_reference = np.asarray(
+            bundle["transaction_score_reference"]
+        )
+
+        anomaly_scores = (
             np.searchsorted(
-                reference,
-                feature_errors[:, j],
+                transaction_reference,
+                transaction_raw_score,
                 side="right"
             )
-            / len(reference)
+            / len(transaction_reference)
+        ).astype(np.float32)
+
+        print(
+            "✅ Autoencoder scoring complete | "
+            f"rows={len(anomaly_scores):,} | "
+            f"min={anomaly_scores.min():.6f} | "
+            f"mean={anomaly_scores.mean():.6f} | "
+            f"max={anomaly_scores.max():.6f}"
         )
 
-    # Final64 selected aggregation method = mean_all
-    transaction_raw_score = (
-        feature_percentiles.mean(axis=1)
-    )
-
-    # -------------------------------------------------
-    # 10. Calibrate against saved transaction reference
-    # -------------------------------------------------
-    transaction_reference = np.asarray(
-        bundle["transaction_score_reference"]
-    )
-
-    anomaly_scores = (
-        np.searchsorted(
-            transaction_reference,
-            transaction_raw_score,
-            side="right"
-        )
-        / len(transaction_reference)
-    ).astype(np.float32)
-
-    print(
-        "✅ Autoencoder scoring complete | "
-        f"rows={len(anomaly_scores):,} | "
-        f"min={anomaly_scores.min():.6f} | "
-        f"mean={anomaly_scores.mean():.6f} | "
-        f"max={anomaly_scores.max():.6f}"
-    )
-
-    return {
-        "ml_probabilities": {
-            "anomaly_score": anomaly_scores.tolist()
+        return {
+            "ml_probabilities": {
+                "anomaly_score": anomaly_scores.tolist()
+            }
         }
-    }
-
+    except Exception as e:
+        print("❌ CRASH INSIDE AUTOENCODER MODEL:")
+        print(f"❌ CRASH TYPE: {type(e).__name__}")
+        print(f"❌ CRASH MESSAGE: {str(e)}")
+        print("❌ FULL TRACEBACK:")
+        traceback.print_exc()
+        raise e
 
 def run_behavioral_model(state: dict) -> dict:
     print("--- RUNNING BEHAVIORAL RISK MODEL ---")

@@ -35,41 +35,50 @@
     <script>
         lucide.createIcons();
 
-        async function triggerPipeline() {
+     async function triggerPipeline() {
             const btn = document.getElementById('runPipelineBtn');
             const grid = document.getElementById('casesGrid');
             
-            // UI Loading State
             btn.innerHTML = `<i data-lucide="loader-2" class="w-4 h-4 animate-spin"></i> Processing...`;
             btn.disabled = true;
             grid.innerHTML = '';
             lucide.createIcons();
 
             try {
-                // Call FastAPI Backend
                 const response = await fetch('http://127.0.0.1:8000/pipeline/analyze', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ csv_path: "input/unlabeled_transactions.csv" })
+                    body: JSON.stringify({ final_parquet_path: "Data/processed/sample_1000k.parquet" })
                 });
                 
                 const data = await response.json();
+                console.log("FastAPI Response Payload:", data);
                 
-                if (data.high_risk_alerts_found === 0) {
+                // --- FIXED KEYS BASED ON YOUR CONSOLE LOG ---
+                const insights = data.case_data || [];
+                const reports = data.reports || [];
+                
+                if (insights.length === 0) {
                     grid.innerHTML = `<p class="text-emerald-600 font-medium col-span-full">✅ Pipeline finished safely. No high-risk transactions detected.</p>`;
                 } else {
-                    // Render Cards dynamically
                     window.caseDatabase = {}; 
 
-                    data.case_data.forEach((alert, index) => {
-                        const accountId = alert.Account || alert.account || "Unknown Entity";
-                        const counterparty = alert.Account_duplicated_0 || alert.account_duplicated_0 || "Unknown Counterparty";
-                        const safeAmount = Number(alert['Amount Paid'] || alert['amount paid'] || 0).toLocaleString();
-                        const safeScore = Number(alert.final_risk_score || 0).toFixed(2);
+                    insights.forEach((alert, index) => {
+                        const accountId = alert.Account || alert.account || alert.account_id || "Unknown Entity";                   
+                        const safeScore = Number(alert.final_risk_score || alert.risk_score || alert.score || 0).toFixed(2);
                         const riskLabel = alert.risk_label || 'HIGH RISK';
-                        const reportText = data.reports[index] || "Notice: SAR generation was throttled.";
+                        const reportText = reports[index] || alert.report || "Notice: SAR generation was throttled.";
+                        
+                        const counterparty = (
+                            alert.Account_duplicated_0 ?? 
+                            alert.account_duplicated_0 ?? 
+                            alert['Account_duplicated_0'] ?? 
+                            alert.counterparty ?? 
+                            alert.Receiver ?? 
+                            alert.To_Entity_Name ?? 
+                            "Unknown Counterparty"
+                        );
 
-                        // Save to global lookup
                         window.caseDatabase[accountId] = { alert, report: reportText };
 
                         const card = document.createElement('div');
@@ -84,7 +93,6 @@
                             </div>
                             <div class="space-y-2 text-sm text-slate-600 mb-6">
                                 <p><strong class="text-slate-800">Counterparty:</strong> ${counterparty}</p>
-                                <p><strong class="text-slate-800">Amount:</strong> $${safeAmount}</p>
                                 <p><strong class="text-slate-800">Final Risk Score:</strong> ${safeScore} / 1.0</p>
                             </div>
                             <button 
@@ -104,17 +112,16 @@
                         window.location.href = 'chat.html';
                     };
 
-
                     lucide.createIcons();
                 }
             } catch (error) {
                 grid.innerHTML = `<p class="text-red-500 text-sm col-span-full">⚠️ Error connecting to FastAPI: ${error.message}</p>`;
             }
 
-            // Reset UI
             btn.innerHTML = `<i data-lucide="play" class="w-4 h-4"></i> Run Risk Agent`;
             btn.disabled = false;
             lucide.createIcons();
+            
         }
 
         function openChat(caseId, encodedReport) {
@@ -122,6 +129,8 @@
             localStorage.setItem('selectedCaseReport', decodeURIComponent(encodedReport));
             window.location.href = 'chat.html';
         }
+
+        
     </script>
 </body>
 </html>
