@@ -53,7 +53,7 @@ def get_all_dates():
     con.close()
 
     return [
-        str(d)
+        str(d)[:10]
         for d in dates_df["run_date"]
     ]
 

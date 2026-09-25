@@ -14,10 +14,19 @@ from LLM import generate_report
 def preprocessing_node(state: dict) -> dict:
     print("--- LOADING FINAL FEATURE DATASET ---")
 
-    parquet_path = state.get(
-        "final_parquet_path",
-        "input/final_transactions_10k.parquet"
-    )
+    parquet_path = state.get("final_parquet_path")
+
+    if not parquet_path:
+        raise ValueError(
+            "final_parquet_path is required."
+        )
+
+    parquet_path = Path(parquet_path)
+
+    if not parquet_path.is_file():
+        raise FileNotFoundError(
+            f"Final parquet file not found: {parquet_path}"
+        )
 
     df = pd.read_parquet(parquet_path)
 
