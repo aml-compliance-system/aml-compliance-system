@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local environment
+.env
+
+# Large FINDETECT datasets
+Data/processed/FINDETECT_Block_D_Numerical_Final/
+
+# Local pipeline inputs
+input/*.parquet
+
+# Pipeline outputs
+outputs/
+
+# Temporary daily files
+.tmp/

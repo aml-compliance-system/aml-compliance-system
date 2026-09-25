@@ -4,6 +4,7 @@ import duckdb
 import xgboost as xgb
 import pandas as pd
 import os
+from pathlib import Path
 
 import uuid
 # Import the function from your LLM.py file
@@ -148,20 +149,24 @@ def run_anomaly_model(state: dict) -> dict:
 
     df = state["final_df"].copy()
 
-    # Portable model directory:
-    # In Colab we will point this environment variable to Google Drive.
-    model_dir = os.environ.get(
-        "AUTOENCODER_MODEL_DIR",
-        "models/autoencoder_final64"
+    # Portable Autoencoder model directory.
+    # Default: models/autoencoder_final64 inside this repository.
+    # Can optionally be overridden with AUTOENCODER_MODEL_DIR.
+    repo_root = Path(__file__).resolve().parent
+
+    model_dir = Path(
+        os.environ.get(
+            "AUTOENCODER_MODEL_DIR",
+            repo_root / "models" / "autoencoder_final64"
+        )
+    ).expanduser().resolve()
+
+    model_path = (
+        model_dir / "autoencoder_final64.keras"
     )
 
-    model_path = os.path.join(
-        model_dir,
-        "autoencoder_final64.keras"
-    )
-
-    bundle_path = os.path.join(
-        model_dir,
+    bundle_path = (
+        model_dir /
         "preprocessing_and_scoring_final64.joblib"
     )
 

@@ -1,5 +1,6 @@
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -7,22 +8,36 @@ from pathlib import Path
 import duckdb
 
 
-FINAL_GLOB = (
-    "/content/drive/MyDrive/AML_Project/"
-    "aml-compliance-system-main/Data/processed/"
-    "FINDETECT_Block_D_Numerical_Final/"
-    "block_d_numerical_bucket_*.parquet"
+REPO_ROOT = Path(__file__).resolve().parent
+
+FINAL_DATA_DIR = Path(
+    os.environ.get(
+        "FINDETECT_FINAL_DATA_DIR",
+        REPO_ROOT
+        / "Data"
+        / "processed"
+        / "FINDETECT_Block_D_Numerical_Final"
+    )
+).expanduser()
+
+FINAL_GLOB = str(
+    FINAL_DATA_DIR
+    / "block_d_numerical_bucket_*.parquet"
 )
 
 OUTPUT_ROOT = Path(
-    "/content/drive/MyDrive/AML_Project/"
-    "aml-compliance-system-main/Data/processed/"
-    "FINDETECT_Pipeline_Output"
-)
+    os.environ.get(
+        "FINDETECT_OUTPUT_DIR",
+        REPO_ROOT / "outputs" / "FINDETECT_Pipeline_Output"
+    )
+).expanduser().resolve()
 
 TEMP_ROOT = Path(
-    "/content/findetect_daily_temp"
-)
+    os.environ.get(
+        "FINDETECT_TEMP_DIR",
+        REPO_ROOT / ".tmp" / "findetect_daily"
+    )
+).expanduser().resolve()
 
 
 def get_all_dates():
