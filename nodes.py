@@ -11,93 +11,19 @@ from LLM import generate_report
 
 
 def preprocessing_node(state: dict) -> dict:
-    print("--- RUNNING PREPROCESSING (ETL) ---")
-    
-    csv_path = state.get("raw_csv_path", "input/unlabeled_transactions.csv")
-    
-    con = duckdb.connect()
+    print("--- LOADING FINAL FEATURE DATASET ---")
 
-
-    query = f"""
-   WITH raw_batch AS (
-        SELECT *,
-            CAST("Timestamp" AS TIMESTAMP) AS ts,
-            CAST("Amount Received" AS FLOAT) AS amt_rec,
-            CAST("Amount Paid" AS FLOAT) AS amt_paid
-        FROM read_csv_auto('{csv_path}')
-    ),
-    engineered AS (
-        SELECT 
-            *,
-            -- Time & Categorical features
-            CAST(date_part('hour', ts) AS FLOAT) AS hour_of_day,
-            CAST("Receiving Currency" != "Payment Currency" AS FLOAT) AS currency_mismatch,
-            CAST("From Bank" = "To Bank" AS FLOAT) AS same_bank,
-            CAST(hash("Payment Format") % 10000000 AS FLOAT) AS payment_format_hash,
-            
-            -- In-Batch Graph & Rolling Features
-            CAST(COUNT(*) OVER (PARTITION BY "Account") AS FLOAT) AS sender_outgoing_count_so_far_wk,
-            CAST(COUNT(DISTINCT "Account_duplicated_0") OVER (PARTITION BY "Account") AS FLOAT) AS sender_unique_receivers_so_far_wk,
-            CAST(COUNT(*) OVER (PARTITION BY "Account") AS FLOAT) AS sender_out_degree,
-            CAST(COUNT(*) OVER (PARTITION BY "Account_duplicated_0") AS FLOAT) AS receiver_in_degree,
-            CAST(COUNT(DISTINCT "Account_duplicated_0") OVER (PARTITION BY "Account") AS FLOAT) AS sender_unique_counterparties,
-            CAST(COUNT(DISTINCT "Account") OVER (PARTITION BY "Account_duplicated_0") AS FLOAT) AS receiver_unique_counterparties,
-            
-            -- 24h and 72h rolling estimates inside batch
-            CAST(COUNT(*) OVER (
-                PARTITION BY "Account" 
-                ORDER BY ts 
-                RANGE BETWEEN INTERVAL '24' HOUR PRECEDING AND CURRENT ROW
-            ) AS FLOAT) AS outgoing_count_24h,
-            
-            CAST(SUM(amt_paid) OVER (
-                PARTITION BY "Account" 
-                ORDER BY ts 
-                RANGE BETWEEN INTERVAL '24' HOUR PRECEDING AND CURRENT ROW
-            ) AS FLOAT) AS outgoing_sum_24h,
-
-            CAST(COUNT(*) OVER (
-                PARTITION BY "Account" 
-                ORDER BY ts 
-                RANGE BETWEEN INTERVAL '72' HOUR PRECEDING AND CURRENT ROW
-            ) AS FLOAT) AS outgoing_count_72h,
-
-            CAST(SUM(amt_paid) OVER (
-                PARTITION BY "Account" 
-                ORDER BY ts 
-                RANGE BETWEEN INTERVAL '72' HOUR PRECEDING AND CURRENT ROW
-            ) AS FLOAT) AS outgoing_sum_72h
-
-        FROM raw_batch
+    parquet_path = state.get(
+        "final_parquet_path",
+        "input/final_transactions_10k.parquet"
     )
-    SELECT * FROM engineered
-    """
-    
-    df = con.execute(query).df()
-    
-    # 2. Historical features (If running against a local sample without past-week tables, 
-    # fill remaining non-batch historical columns with column-wise defaults or medians)
-    remaining_historical_cols = [
-        "sender_in_degree", "receiver_out_degree", "sender_receiver_frequency", 
-        "bidirectional_relationship", "sender_total_sent_prev_week", 
-        "sender_avg_sent_prev_week", "sender_max_sent_prev_week", 
-        "sender_outgoing_count_prev_week", "receiver_total_received_prev_week", 
-        "receiver_avg_received_prev_week", "receiver_max_received_prev_week", 
-        "receiver_incoming_count_prev_week", "amount_vs_prev_max_diff", 
-        "amount_vs_prev_max_ratio", "transaction_frequency_diff", 
-        "transaction_frequency_ratio", "hours_since_last_incoming", 
-        "outgoing_to_incoming_ratio"
-    ]
-    
-    for col in remaining_historical_cols:
-        if col not in df.columns:
-            df[col] = 0.0
 
-    print(f"✅ Real-time ETL complete. Calculated batch rolling aggregates for {len(df)} transactions.")
-    return {"cleaned_df": df}
+    df = pd.read_parquet(parquet_path)
 
+    print(f"✅ Final dataset loaded: {len(df)} transactions.")
+    print(f"✅ Columns loaded: {len(df.columns)}")
 
-
+    return {"final_df": df}
 
 
 # This list MUST match the exact order of features used when you trained the model on the A100.
@@ -120,66 +46,352 @@ FEATURE_COLS = [
 
 def run_xgboost_model(state: dict) -> dict:
     print("--- RUNNING XGBOOST MODEL ---")
-    
-    df = state["cleaned_df"]
-    
 
-    model_path = "models/final_xgboost_aml_model.json" 
-    
-    # Initialize the XGBoost Booster
+    df = state["final_df"]
+
+    model_path = "models/final_xgboost_aml_model.json"
+
+    # -------------------------------------------------
+    # 1. Validate required features
+    # -------------------------------------------------
+    missing = [
+        col for col in FEATURE_COLS
+        if col not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            f"XGBoost missing required features: {missing}"
+        )
+
+    # -------------------------------------------------
+    # 2. Load trained model
+    # -------------------------------------------------
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(
+            f"XGBoost model not found: {model_path}"
+        )
+
     model = xgb.Booster()
-    
-    try:
-        model.load_model(model_path)
-    except Exception as e:
-        print(f"Error loading model at {model_path}: {e}")
-        print("Fallback: Outputting 0.0 probabilities to keep pipeline moving for local testing.")
-        # Retrieve existing dict or create new one
-        ml_probs = state.get("ml_probabilities", {})
-        ml_probs["xgb_prob"] = [0.0] * len(df)
-        return {"ml_probabilities": ml_probs}
-        
-    # 2. Extract features in the strict order required by XGBoost
+    model.load_model(model_path)
+
+    # -------------------------------------------------
+    # 3. Exact trained feature order
+    # -------------------------------------------------
     X = df[FEATURE_COLS].copy()
-    
-# 3. Create the DMatrix and run inference
-    dmatrix = xgb.DMatrix(X)
-    raw_probabilities = model.predict(dmatrix)
-    
-    # NORMALIZATION 
-    probs_array = np.array(raw_probabilities)
-    
-    min_p = np.min(probs_array)
-    max_p = np.max(probs_array)
-    
-    # Scale from 0.0 to 1.0 (where the highest risk in the batch becomes exactly 1.0)
-    if max_p > min_p:
-        normalized_probs = (probs_array - min_p) / (max_p - min_p)
-    else:
-        normalized_probs = np.zeros_like(probs_array) 
-        
-    # Optional: If you want XGBoost to contribute a MAXIMUM of 0.3 to your final score
-    # xgb_risk_weights = normalized_probs * 0.3
-    
-    print(f"✅ XGBoost scored {len(normalized_probs)} transactions.")
-    
-    ml_probs = state.get("ml_probabilities", {})
-    ml_probs["xgb_prob"] = normalized_probs.tolist()  
-    return {"ml_probabilities": ml_probs}
 
+    dmatrix = xgb.DMatrix(
+        X,
+        feature_names=FEATURE_COLS
+    )
 
+    # -------------------------------------------------
+    # 4. Direct probability inference
+    #
+    # Model objective = binary:logistic
+    # Therefore model.predict() already returns
+    # probabilities on the 0-1 scale.
+    #
+    # IMPORTANT:
+    # No batch Min-Max normalization.
+    # -------------------------------------------------
+    probabilities = np.asarray(
+        model.predict(dmatrix),
+        dtype=np.float32
+    )
 
+    if len(probabilities) != len(df):
+        raise ValueError(
+            "XGBoost prediction length mismatch: "
+            f"{len(probabilities)} predictions "
+            f"for {len(df)} transactions."
+        )
 
+    if not np.isfinite(probabilities).all():
+        raise ValueError(
+            "XGBoost produced non-finite probabilities."
+        )
 
+    if (
+        (probabilities < 0.0).any()
+        or (probabilities > 1.0).any()
+    ):
+        raise ValueError(
+            "binary:logistic XGBoost produced "
+            "probabilities outside [0, 1]."
+        )
+
+    print(
+        "✅ XGBoost scoring complete | "
+        f"rows={len(probabilities):,} | "
+        f"min={probabilities.min():.6f} | "
+        f"mean={probabilities.mean():.6f} | "
+        f"max={probabilities.max():.6f}"
+    )
+
+    return {
+        "ml_probabilities": {
+            "xgb_prob": probabilities.tolist()
+        }
+    }
 
 
 # 3. Anomaly Model Node
 def run_anomaly_model(state: dict) -> dict:
-    print("--- RUNNING ANOMALY DETECTION ---")
-    df = state["cleaned_df"]
-    anomaly_scores = [0.0] * len(df)
-    return {"ml_probabilities": {"anomaly_score": anomaly_scores}}
+    print("--- RUNNING AUTOENCODER ANOMALY DETECTION ---")
 
+    import os
+    import joblib
+    import numpy as np
+    import pandas as pd
+    import tensorflow as tf
+
+    df = state["final_df"].copy()
+
+    # Portable model directory:
+    # In Colab we will point this environment variable to Google Drive.
+    model_dir = os.environ.get(
+        "AUTOENCODER_MODEL_DIR",
+        "models/autoencoder_final64"
+    )
+
+    model_path = os.path.join(
+        model_dir,
+        "autoencoder_final64.keras"
+    )
+
+    bundle_path = os.path.join(
+        model_dir,
+        "preprocessing_and_scoring_final64.joblib"
+    )
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(
+            f"Autoencoder model not found: {model_path}"
+        )
+
+    if not os.path.exists(bundle_path):
+        raise FileNotFoundError(
+            f"Autoencoder preprocessing bundle not found: {bundle_path}"
+        )
+
+    model = tf.keras.models.load_model(
+        model_path,
+        compile=False
+    )
+
+    bundle = joblib.load(bundle_path)
+
+    # -------------------------------------------------
+    # 1. Validate required raw model features
+    # -------------------------------------------------
+    model_raw_features = bundle["model_raw_features"]
+
+    missing = [
+        col for col in model_raw_features
+        if col not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "Autoencoder missing required Final dataset features: "
+            f"{missing}"
+        )
+
+    work = df[model_raw_features].copy()
+
+    # -------------------------------------------------
+    # 2. Derived binary features
+    #
+    # IMPORTANT:
+    # These must be calculated BEFORE imputation so that
+    # the original missing-history information is retained.
+    # -------------------------------------------------
+    work["no_previous_incoming"] = (
+        pd.to_numeric(
+            work["hours_since_last_incoming"],
+            errors="coerce"
+        )
+        .isna()
+        .astype("float32")
+    )
+
+    amount_ratio = pd.to_numeric(
+        work["amount_vs_prev_max_ratio"],
+        errors="coerce"
+    )
+
+    frequency_ratio = pd.to_numeric(
+        work["transaction_frequency_ratio"],
+        errors="coerce"
+    )
+
+    work["undefined_history_ratio"] = (
+        amount_ratio.isna() |
+        frequency_ratio.isna()
+    ).astype("float32")
+
+    # -------------------------------------------------
+    # 3. Clean continuous features
+    # -------------------------------------------------
+    continuous_features = bundle["continuous_features"]
+
+    continuous = (
+        work[continuous_features]
+        .apply(pd.to_numeric, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+    )
+
+    # Same trained imputer
+    imputed = bundle["continuous_imputer"].transform(
+        continuous
+    )
+
+    continuous_processed = pd.DataFrame(
+        imputed,
+        columns=continuous_features,
+        index=work.index
+    )
+
+    # -------------------------------------------------
+    # 4. Apply saved clipping limits
+    # -------------------------------------------------
+    clip_lower = bundle["clip_lower"]
+    clip_upper = bundle["clip_upper"]
+
+    for col in continuous_features:
+        continuous_processed[col] = (
+            continuous_processed[col]
+            .clip(
+                lower=clip_lower[col],
+                upper=clip_upper[col]
+            )
+        )
+
+    # -------------------------------------------------
+    # 5. Apply trained QuantileTransformer
+    # -------------------------------------------------
+    transformed = bundle["quantile_transformer"].transform(
+        continuous_processed[continuous_features]
+    )
+
+    transformed_df = pd.DataFrame(
+        transformed,
+        columns=continuous_features,
+        index=work.index
+    )
+
+    # -------------------------------------------------
+    # 6. Restore binary features
+    # -------------------------------------------------
+    transformed_df["bidirectional_relationship"] = (
+        pd.to_numeric(
+            work["bidirectional_relationship"],
+            errors="coerce"
+        )
+        .fillna(0.0)
+        .clip(0.0, 1.0)
+        .astype("float32")
+    )
+
+    transformed_df["no_previous_incoming"] = (
+        work["no_previous_incoming"]
+        .astype("float32")
+    )
+
+    transformed_df["undefined_history_ratio"] = (
+        work["undefined_history_ratio"]
+        .astype("float32")
+    )
+
+    # -------------------------------------------------
+    # 7. Exact active feature order expected by Final64
+    # -------------------------------------------------
+    active_features = bundle["active_model_features"]
+
+    X = (
+        transformed_df[active_features]
+        .to_numpy(dtype=np.float32)
+    )
+
+    expected_width = model.input_shape[-1]
+
+    if X.shape[1] != expected_width:
+        raise ValueError(
+            f"Autoencoder expected {expected_width} features "
+            f"but received {X.shape[1]}."
+        )
+
+    # -------------------------------------------------
+    # 8. Reconstruction
+    # -------------------------------------------------
+    reconstructed = model.predict(
+        X,
+        batch_size=4096,
+        verbose=0
+    )
+
+    feature_errors = np.square(
+        X - reconstructed
+    )
+
+    # -------------------------------------------------
+    # 9. Convert each feature error to its empirical
+    # percentile using the saved Final64 references
+    # -------------------------------------------------
+    feature_refs = bundle["feature_error_references"]
+
+    feature_percentiles = np.empty_like(
+        feature_errors,
+        dtype=np.float32
+    )
+
+    for j, reference in enumerate(feature_refs):
+        reference = np.asarray(reference)
+
+        feature_percentiles[:, j] = (
+            np.searchsorted(
+                reference,
+                feature_errors[:, j],
+                side="right"
+            )
+            / len(reference)
+        )
+
+    # Final64 selected aggregation method = mean_all
+    transaction_raw_score = (
+        feature_percentiles.mean(axis=1)
+    )
+
+    # -------------------------------------------------
+    # 10. Calibrate against saved transaction reference
+    # -------------------------------------------------
+    transaction_reference = np.asarray(
+        bundle["transaction_score_reference"]
+    )
+
+    anomaly_scores = (
+        np.searchsorted(
+            transaction_reference,
+            transaction_raw_score,
+            side="right"
+        )
+        / len(transaction_reference)
+    ).astype(np.float32)
+
+    print(
+        "✅ Autoencoder scoring complete | "
+        f"rows={len(anomaly_scores):,} | "
+        f"min={anomaly_scores.min():.6f} | "
+        f"mean={anomaly_scores.mean():.6f} | "
+        f"max={anomaly_scores.max():.6f}"
+    )
+
+    return {
+        "ml_probabilities": {
+            "anomaly_score": anomaly_scores.tolist()
+        }
+    }
 
 
 def run_behavioral_model(state: dict) -> dict:
@@ -188,7 +400,7 @@ def run_behavioral_model(state: dict) -> dict:
     import numpy as np
     import pandas as pd
 
-    df = state["cleaned_df"].copy()
+    df = state["final_df"].copy()
 
     # -------------------------------------------------
     # 1. Required behavioral features
@@ -463,154 +675,894 @@ def run_behavioral_model(state: dict) -> dict:
 
 # 4. Graph Context Node (cuGraph)
 def graph_context_node(state: dict) -> dict:
-    print("--- EXTRACTING TARGETED GRAPH SUBGRAPHS ---")
-    df = state["cleaned_df"].copy()
+    print("--- RUNNING SILENT-MULE GRAPH ANALYSIS ---")
+
+    import numpy as np
+    import pandas as pd
+
+    # -------------------------------------------------
+    # Configuration from Graph2_2B
+    # -------------------------------------------------
+    XGB_WEIGHT = 0.40
+    ANOMALY_WEIGHT = 0.30
+    BEHAVIORAL_WEIGHT = 0.30
+
+    SEED_THRESHOLD = 0.75
+    GRAPH_RECEIVING_PENALTY = 0.40
+    INVESTIGATION_THRESHOLD = 0.50
+
+    df = state["final_df"].copy()
     ml_probs = state.get("ml_probabilities", {})
-    
-    # 1. Read the ML scores that just finished running
-    xgb_probs = ml_probs.get("xgb_prob", [0.0] * len(df))
-    df['temp_ml_score'] = xgb_probs
-    
-    # 2. Identify the "Account As" (The Orchestrators)
-    # Anyone with a base ML score over 0.75 is considered highly suspicious
-    high_risk_senders = df[df['temp_ml_score'] >= 0.75]['Account'].unique()
-    
-    # 3. Find the "Account Bs" (The Silent Mules)
-    # Who did the high-risk orchestrators send money to in this batch?
-    mules_df = df[df['Account'].isin(high_risk_senders)]
-    exposed_receivers = mules_df['Account_duplicated_0'].unique()
-    
-    # 4. Generate the Graph Penalty Array for the entire batch
-    # If a row's receiver is in the exposed_receivers list, they get the +0.40 penalty
-    graph_penalties = []
-    for receiver in df['Account_duplicated_0']:
-        if receiver in exposed_receivers:
-            graph_penalties.append(0.40) 
-        else:
-            graph_penalties.append(0.0)
-            
-    print(f"Graph extracted {len(high_risk_senders)} high-risk nodes and penalized {sum(p > 0 for p in graph_penalties)} exposed connections.")
-    
-    return {"subgraph_data": {"penalties": graph_penalties}}
+
+    # -------------------------------------------------
+    # 1. Retrieve model scores
+    # -------------------------------------------------
+    score_map = {
+        "xgb_prob": ml_probs.get("xgb_prob"),
+        "anomaly_score": ml_probs.get("anomaly_score"),
+        "behavioral_score": ml_probs.get("behavioral_score"),
+    }
+
+    for score_name, values in score_map.items():
+
+        if values is None:
+            raise ValueError(
+                f"Graph node missing model score: {score_name}"
+            )
+
+        if len(values) != len(df):
+            raise ValueError(
+                f"{score_name} length mismatch: "
+                f"{len(values)} scores for {len(df)} transactions."
+            )
+
+        df[score_name] = (
+            pd.to_numeric(
+                pd.Series(values, index=df.index),
+                errors="coerce"
+            )
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+            .clip(0.0, 1.0)
+        )
+
+    # -------------------------------------------------
+    # 2. Validate graph columns
+    # -------------------------------------------------
+    required = [
+        "Account",
+        "Account_duplicated_0",
+    ]
+
+    missing = [
+        col for col in required
+        if col not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            f"Graph node missing required columns: {missing}"
+        )
+
+    # -------------------------------------------------
+    # 3. Determine graph day
+    #
+    # Graph2_2B uses a DAILY directed edgelist.
+    # -------------------------------------------------
+    if "Transaction_Date" in df.columns:
+        graph_dates = pd.to_datetime(
+            df["Transaction_Date"],
+            errors="coerce"
+        )
+
+    elif "Timestamp" in df.columns:
+        graph_dates = pd.to_datetime(
+            df["Timestamp"],
+            errors="coerce"
+        )
+
+    else:
+        raise ValueError(
+            "Graph node requires Transaction_Date or Timestamp."
+        )
+
+    if graph_dates.isna().any():
+        raise ValueError(
+            "Graph node found invalid transaction dates."
+        )
+
+    df["_graph_date"] = graph_dates.dt.normalize()
+
+    # -------------------------------------------------
+    # 4. Phase 1:
+    # Independent ML base risk
+    # -------------------------------------------------
+    df["base_risk"] = (
+        XGB_WEIGHT * df["xgb_prob"]
+        + ANOMALY_WEIGHT * df["anomaly_score"]
+        + BEHAVIORAL_WEIGHT * df["behavioral_score"]
+    ).clip(
+        lower=0.0,
+        upper=1.0
+    )
+
+    # -------------------------------------------------
+    # 5. Transaction -> account/day risk
+    #
+    # Same rule used in Graph2_2B:
+    # strongest observed sender evidence = max
+    # -------------------------------------------------
+    sender_base_risk = (
+        df
+        .groupby(
+            ["_graph_date", "Account"],
+            dropna=True
+        )["base_risk"]
+        .max()
+        .reset_index()
+    )
+
+    # Include accounts appearing only as receivers.
+    sender_accounts = (
+        df[["_graph_date", "Account"]]
+        .dropna()
+        .copy()
+    )
+
+    receiver_accounts = (
+        df[
+            [
+                "_graph_date",
+                "Account_duplicated_0"
+            ]
+        ]
+        .dropna()
+        .rename(
+            columns={
+                "Account_duplicated_0": "Account"
+            }
+        )
+    )
+
+    account_results = (
+        pd.concat(
+            [
+                sender_accounts,
+                receiver_accounts
+            ],
+            ignore_index=True
+        )
+        .drop_duplicates()
+    )
+
+    account_results = account_results.merge(
+        sender_base_risk,
+        on=["_graph_date", "Account"],
+        how="left"
+    )
+
+    account_results["base_risk"] = (
+        account_results["base_risk"]
+        .fillna(0.0)
+        .astype(float)
+    )
+
+    # -------------------------------------------------
+    # 6. Phase 2:
+    # High-risk seeds
+    #
+    # IMPORTANT:
+    # Graph2_2B specifies > 0.75, not >= 0.75.
+    # -------------------------------------------------
+    account_results["is_high_risk_seed"] = (
+        account_results["base_risk"]
+        > SEED_THRESHOLD
+    )
+
+    seed_keys = (
+        account_results.loc[
+            account_results["is_high_risk_seed"],
+            ["_graph_date", "Account"]
+        ]
+        .drop_duplicates()
+    )
+
+    # -------------------------------------------------
+    # 7. Extract directed edges from ORIGINAL seeds
+    # -------------------------------------------------
+    seed_edges = df.merge(
+        seed_keys.assign(_is_seed=True),
+        on=["_graph_date", "Account"],
+        how="inner"
+    )
+
+    # Self-transfer does not count as graph exposure.
+    # Filter the edge itself, not the whole account.
+    seed_edges = seed_edges[
+        seed_edges["Account"]
+        != seed_edges["Account_duplicated_0"]
+    ].copy()
+
+    # -------------------------------------------------
+    # 8. Direct 1-hop exposed receivers
+    # -------------------------------------------------
+    exposed_keys = (
+        seed_edges[
+            [
+                "_graph_date",
+                "Account_duplicated_0"
+            ]
+        ]
+        .dropna()
+        .drop_duplicates()
+        .rename(
+            columns={
+                "Account_duplicated_0": "Account"
+            }
+        )
+    )
+
+    exposed_keys[
+        "received_from_high_risk"
+    ] = True
+
+    account_results = account_results.merge(
+        exposed_keys,
+        on=["_graph_date", "Account"],
+        how="left"
+    )
+
+    account_results[
+        "received_from_high_risk"
+    ] = (
+        account_results[
+            "received_from_high_risk"
+        ]
+        .eq(True)
+    )
+
+    # -------------------------------------------------
+    # 9. Strict one-time graph penalty
+    #
+    # No multiplication by:
+    # - number of transfers
+    # - number of seed accounts
+    # - transaction amount
+    # -------------------------------------------------
+    account_results["graph_penalty"] = np.where(
+        account_results["received_from_high_risk"],
+        GRAPH_RECEIVING_PENALTY,
+        0.0
+    )
+
+    # -------------------------------------------------
+    # 10. Final account risk
+    # -------------------------------------------------
+    account_results["final_risk_score"] = (
+        account_results["base_risk"]
+        + account_results["graph_penalty"]
+    ).clip(
+        lower=0.0,
+        upper=1.0
+    )
+
+    account_results["investigation_flag"] = (
+        account_results["final_risk_score"]
+        >= INVESTIGATION_THRESHOLD
+    )
+
+    # -------------------------------------------------
+    # 11. Save A -> B exposure evidence
+    # -------------------------------------------------
+    evidence_cols = [
+        "_graph_date",
+        "Account",
+        "Account_duplicated_0",
+    ]
+
+    if "Amount Paid" in seed_edges.columns:
+        evidence_cols.append("Amount Paid")
+
+    exposure_evidence = (
+        seed_edges[evidence_cols]
+        .rename(
+            columns={
+                "_graph_date": "graph_date",
+                "Account": "high_risk_sender",
+                "Account_duplicated_0":
+                    "exposed_receiver",
+            }
+        )
+        .copy()
+    )
+
+    # -------------------------------------------------
+    # 12. Human-readable date column
+    # -------------------------------------------------
+    account_results = account_results.rename(
+        columns={
+            "_graph_date": "graph_date"
+        }
+    )
+
+    # -------------------------------------------------
+    # 13. Diagnostics
+    # -------------------------------------------------
+    print("========================================")
+    print("FINDETECT SILENT-MULE GRAPH")
+    print("========================================")
+
+    print(
+        f"Transactions evaluated : {len(df):,}"
+    )
+
+    print(
+        f"Account/day nodes      : "
+        f"{len(account_results):,}"
+    )
+
+    print(
+        f"High-risk seeds > {SEED_THRESHOLD}: "
+        f"{account_results['is_high_risk_seed'].sum():,}"
+    )
+
+    print(
+        f"Direct 1-hop receivers : "
+        f"{account_results['received_from_high_risk'].sum():,}"
+    )
+
+    print(
+        f"Flagged >= {INVESTIGATION_THRESHOLD}: "
+        f"{account_results['investigation_flag'].sum():,}"
+    )
+
+    # IMPORTANT:
+    # No propagation from exposed B -> C.
+    # Only original ML high-risk seeds generate exposure.
+
+    return {
+        "subgraph_data": {
+            "account_results": account_results,
+            "high_risk_seeds": (
+                account_results.loc[
+                    account_results["is_high_risk_seed"],
+                    ["graph_date", "Account"]
+                ]
+                .to_dict(orient="records")
+            ),
+            "exposed_receivers": (
+                account_results.loc[
+                    account_results[
+                        "received_from_high_risk"
+                    ],
+                    ["graph_date", "Account"]
+                ]
+                .to_dict(orient="records")
+            ),
+            "exposure_evidence": exposure_evidence,
+            "seed_threshold": SEED_THRESHOLD,
+            "graph_penalty": GRAPH_RECEIVING_PENALTY,
+            "investigation_threshold":
+                INVESTIGATION_THRESHOLD,
+        }
+    }
+
 
 # 5. Risk Agent Node (Mathematical Weighting)
 def risk_agent_node(state: dict) -> dict:
-    print("--- RUNNING RISK AGENT MATH WEIGHTING ---")
-    
-    df = state["cleaned_df"].copy()
-    ml_probs = state.get("ml_probabilities", {})
-    
-    # 1. Retrieve the probabilities (using zeroes if a model failed/skipped)
-    xgb_probs = ml_probs.get("xgb_prob", [0.0] * len(df))
-    anomaly_probs = ml_probs.get("anomaly_score", [0.0] * len(df)) 
-    behavioral_probs = ml_probs.get("behavioral_score", [0.0] * len(df))
-    
-    # Retrieve Graph Penalties calculated sequentially after the ML models
-    graph_penalties = state.get("subgraph_data", {}).get("penalties", [0.0] * len(df))
-    
-    # 2. Calculate Base ML Score (Out of 1.0)
-    # Blend the 3 models (e.g., 40% XGBoost, 30% Anomaly, 30% Behavioral)
-    base_ml_scores = [
-        (x * 0.40) + (a * 0.30) + (b * 0.30) 
-        for x, a, b in zip(xgb_probs, anomaly_probs, behavioral_probs)
-    ]
-    
-    # 3. Add Graph Penalty & Cap at 1.0
-    # If the Silent Mule has a 0.15 ML Base + 0.40 Graph Penalty = 0.55 Final Score.
-    # If the Orchestrator has a 0.85 ML Base + 0.00 Graph Penalty = 0.85 Final Score.
-    final_scores = [
-        min(base + graph, 1.0) 
-        for base, graph in zip(base_ml_scores, graph_penalties)
-    ]
-    
-    df['final_risk_score'] = final_scores
-    
-    # 4. Assign Risk Labels based on your 0.55 Threshold
-    def assign_label(score):
-        if score >= 0.55:
-            return "High Risk"
-        elif score >= 0.30:
-            return "Medium Risk"
-        else:
-            return "Low Risk"
-            
-    df['risk_label'] = df['final_risk_score'].apply(assign_label)
-    
-    # 5. Filter for High-Risk accounts to push to the LLM API
-    high_risk_df = df[df['risk_label'] == "High Risk"].copy()
-    
-    print(f"🚨 Risk Agent assigned labels: {len(high_risk_df)} High Risk, "
-          f"{len(df[df['risk_label'] == 'Medium Risk'])} Medium Risk, "
-          f"{len(df[df['risk_label'] == 'Low Risk'])} Low Risk.")
-    
-    # Keep only the essential columns for the LLM
-    alert_cols = ["Account", "Account_duplicated_0", "Amount Paid", "Payment Format", "final_risk_score", "risk_label"]
-    risk_alerts = high_risk_df[alert_cols].to_dict(orient="records") if not high_risk_df.empty else []
-    
-    # Pass the fully labeled dataframe and the filtered alerts forward
-    return {"risk_scores": df, "final_insights": risk_alerts}
+    print("--- RUNNING RISK AGENT ---")
 
+    import numpy as np
+    import pandas as pd
+
+    graph_data = state.get("subgraph_data", {})
+
+    account_results = graph_data.get("account_results")
+
+    if account_results is None:
+        raise ValueError(
+            "Risk Agent did not receive account_results "
+            "from the graph node."
+        )
+
+    if not isinstance(account_results, pd.DataFrame):
+        raise TypeError(
+            "subgraph_data['account_results'] "
+            "must be a pandas DataFrame."
+        )
+
+    results = account_results.copy()
+
+    # -------------------------------------------------
+    # 1. Validate graph output
+    # -------------------------------------------------
+    required = [
+        "graph_date",
+        "Account",
+        "base_risk",
+        "graph_penalty",
+        "final_risk_score",
+        "investigation_flag",
+    ]
+
+    missing = [
+        col for col in required
+        if col not in results.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            f"Risk Agent missing graph outputs: {missing}"
+        )
+
+    # -------------------------------------------------
+    # 2. Use graph final score directly
+    #
+    # IMPORTANT:
+    # Do NOT recompute model weighting here.
+    #
+    # Graph node already calculated:
+    #
+    # base risk =
+    # 0.40 XGB
+    # + 0.30 Autoencoder
+    # + 0.30 Behavioral
+    #
+    # final risk =
+    # base risk + graph penalty
+    # -------------------------------------------------
+    results["final_risk_score"] = (
+        pd.to_numeric(
+            results["final_risk_score"],
+            errors="coerce"
+        )
+        .fillna(0.0)
+        .clip(0.0, 1.0)
+    )
+
+    investigation_threshold = float(
+        graph_data.get(
+            "investigation_threshold",
+            0.50
+        )
+    )
+
+    results["investigation_flag"] = (
+        results["final_risk_score"]
+        >= investigation_threshold
+    )
+
+    # -------------------------------------------------
+    # 3. Operational risk labels
+    #
+    # High Risk = crosses investigation threshold
+    # Medium Risk = 0.30 up to threshold
+    # Low Risk = below 0.30
+    # -------------------------------------------------
+    results["risk_label"] = np.select(
+        [
+            results["investigation_flag"],
+            results["final_risk_score"] >= 0.30,
+        ],
+        [
+            "High Risk",
+            "Medium Risk",
+        ],
+        default="Low Risk"
+    )
+
+    # -------------------------------------------------
+    # 4. Accounts routed to investigation / LLM
+    # -------------------------------------------------
+    flagged_accounts = results[
+        results["investigation_flag"]
+    ].copy()
+
+    high_count = (
+        results["risk_label"]
+        .eq("High Risk")
+        .sum()
+    )
+
+    medium_count = (
+        results["risk_label"]
+        .eq("Medium Risk")
+        .sum()
+    )
+
+    low_count = (
+        results["risk_label"]
+        .eq("Low Risk")
+        .sum()
+    )
+
+    print(
+        f"🚨 Risk Agent results | "
+        f"High={high_count:,} | "
+        f"Medium={medium_count:,} | "
+        f"Low={low_count:,}"
+    )
+
+    print(
+        f"✅ {len(flagged_accounts):,} account/day "
+        f"cases routed for investigation."
+    )
+
+    return {
+        "risk_scores": results,
+        "final_insights": (
+            flagged_accounts
+            .to_dict(orient="records")
+        )
+    }
 
 
 # 6. LLM API Node
 def llm_api_node(state: dict) -> dict:
-    alerts = state.get("final_insights", [])
-    sar_reports = []
+    print("--- BUILDING ACCOUNT/DAY SAR CASES ---")
 
-    # If the Risk Agent found no high-risk transactions, skip the LLM entirely
+    import uuid
+    import pandas as pd
+
+    alerts = state.get("final_insights", [])
+    graph_data = state.get("subgraph_data", {})
+
     if not alerts:
-        print("✅ No high-risk transactions detected. Skipping SAR generation.")
+        print(
+            "✅ No investigation-level accounts detected. "
+            "Skipping SAR generation."
+        )
         return {"sar_reports": []}
 
-    print(f"--- CALLING LLM TO GENERATE {len(alerts)} SAR(s) ---")
+    exposure_evidence = graph_data.get(
+        "exposure_evidence"
+    )
 
-    alerts = sorted(alerts, key=lambda x: x.get('final_risk_score', 0), reverse=True)
-    
-    for alert in alerts:
-        # 1. Structure the payload to match the exact schema expected by LLM.py
-        structured_case = {
-            "case_id": f"CASE-{uuid.uuid4().hex[:8].upper()}",
-            "customer": {
-                "customer_id": alert['Account'],
-                "name_masked": "Redacted Entity",
-                "segment": "Transaction Monitoring Batch"
-            },
-            "risk_score": round(alert['final_risk_score'], 2),
-            "risk_tier": alert['risk_label'].upper().replace(" ", "_"), # e.g., "HIGH_RISK"
-            "reason_codes": [
-                {"code": "RC-ML-01", "description": "High autonomous machine learning risk probability"},
-                {"code": "RC-GRAPH-01", "description": "Anomalous network topology or silent mule connection"}
-            ],
-            "model_scores": {
-                "supervised": round(alert['final_risk_score'], 2),
-                "anomaly": 0.0, # Placeholder until anomaly scores are mapped to the alert
-                "behavioral_z": 0.0
-            },
-            "transactions": [
-                {
-                    "timestamp": "Batch Processing",
-                    "from_account": alert['Account'],
-                    "to_account": alert['Account_duplicated_0'],
-                    "amount_sar": alert['Amount Paid'],
-                    "direction": "outbound",
-                    "payment_format": alert['Payment Format']
-                }
+    if exposure_evidence is None:
+        exposure_evidence = pd.DataFrame(
+            columns=[
+                "graph_date",
+                "high_risk_sender",
+                "exposed_receiver",
+                "Amount Paid",
             ]
+        )
+
+    elif not isinstance(
+        exposure_evidence,
+        pd.DataFrame
+    ):
+        exposure_evidence = pd.DataFrame(
+            exposure_evidence
+        )
+
+    if not exposure_evidence.empty:
+        exposure_evidence = (
+            exposure_evidence.copy()
+        )
+
+        exposure_evidence["graph_date"] = (
+            pd.to_datetime(
+                exposure_evidence["graph_date"],
+                errors="coerce"
+            )
+            .dt.normalize()
+        )
+
+    print(
+        f"--- GENERATING {len(alerts):,} "
+        "ACCOUNT/DAY SAR CASE(S) ---"
+    )
+
+    alerts = sorted(
+        alerts,
+        key=lambda x: x.get(
+            "final_risk_score",
+            0.0
+        ),
+        reverse=True
+    )
+
+    sar_reports = []
+
+    for alert in alerts:
+
+        account = alert["Account"]
+
+        graph_date = pd.to_datetime(
+            alert["graph_date"],
+            errors="coerce"
+        )
+
+        if pd.isna(graph_date):
+            graph_date_str = "N/A"
+            normalized_date = None
+        else:
+            normalized_date = graph_date.normalize()
+            graph_date_str = (
+                normalized_date
+                .strftime("%Y-%m-%d")
+            )
+
+        # -----------------------------------------
+        # 1. Build reason codes from actual case
+        # -----------------------------------------
+        reason_codes = []
+
+        if bool(
+            alert.get(
+                "is_high_risk_seed",
+                False
+            )
+        ):
+            reason_codes.append(
+                {
+                    "code": "RC-ML-SEED",
+                    "description":
+                        "Account exceeded the "
+                        "combined ML high-risk "
+                        "seed threshold"
+                }
+            )
+
+        if bool(
+            alert.get(
+                "received_from_high_risk",
+                False
+            )
+        ):
+            reason_codes.append(
+                {
+                    "code": "RC-GRAPH-1HOP",
+                    "description":
+                        "Account received funds "
+                        "directly from an original "
+                        "high-risk seed"
+                }
+            )
+
+        if not reason_codes:
+            reason_codes.append(
+                {
+                    "code": "RC-RISK-THRESHOLD",
+                    "description":
+                        "Account crossed the "
+                        "operational investigation "
+                        "risk threshold"
+                }
+            )
+
+        # -----------------------------------------
+        # 2. Collect real graph evidence
+        # -----------------------------------------
+        transactions = []
+
+        if (
+            normalized_date is not None
+            and not exposure_evidence.empty
+        ):
+
+            same_day = (
+                exposure_evidence[
+                    "graph_date"
+                ]
+                == normalized_date
+            )
+
+            # Incoming exposure:
+            # high-risk A -> current account B
+            incoming = exposure_evidence[
+                same_day
+                & (
+                    exposure_evidence[
+                        "exposed_receiver"
+                    ]
+                    == account
+                )
+            ]
+
+            for _, row in incoming.iterrows():
+
+                amount = row.get(
+                    "Amount Paid",
+                    0.0
+                )
+
+                amount = (
+                    0.0
+                    if pd.isna(amount)
+                    else float(amount)
+                )
+
+                transactions.append(
+                    {
+                        "timestamp":
+                            graph_date_str,
+                        "from_account":
+                            row[
+                                "high_risk_sender"
+                            ],
+                        "to_account":
+                            row[
+                                "exposed_receiver"
+                            ],
+                        "amount_sar":
+                            amount,
+                        "direction":
+                            "inbound graph exposure",
+                    }
+                )
+
+            # Outgoing evidence:
+            # current account is original seed A
+            outgoing = exposure_evidence[
+                same_day
+                & (
+                    exposure_evidence[
+                        "high_risk_sender"
+                    ]
+                    == account
+                )
+            ]
+
+            for _, row in outgoing.iterrows():
+
+                amount = row.get(
+                    "Amount Paid",
+                    0.0
+                )
+
+                amount = (
+                    0.0
+                    if pd.isna(amount)
+                    else float(amount)
+                )
+
+                transactions.append(
+                    {
+                        "timestamp":
+                            graph_date_str,
+                        "from_account":
+                            row[
+                                "high_risk_sender"
+                            ],
+                        "to_account":
+                            row[
+                                "exposed_receiver"
+                            ],
+                        "amount_sar":
+                            amount,
+                        "direction":
+                            "outbound seed exposure",
+                    }
+                )
+
+        # -----------------------------------------
+        # 3. Build structured account/day case
+        # -----------------------------------------
+        structured_case = {
+            "case_id": (
+                f"CASE-"
+                f"{uuid.uuid4().hex[:8].upper()}"
+            ),
+
+            "customer": {
+                "customer_id": account,
+                "name_masked":
+                    "Redacted Entity",
+                "segment":
+                    "Transaction Monitoring Batch"
+            },
+
+            "risk_score": round(
+                float(
+                    alert[
+                        "final_risk_score"
+                    ]
+                ),
+                6
+            ),
+
+            "risk_tier": (
+                alert.get(
+                    "risk_label",
+                    "High Risk"
+                )
+                .upper()
+                .replace(" ", "_")
+            ),
+
+            "reason_codes":
+                reason_codes,
+
+            "model_scores": {
+                "combined_base_risk":
+                    round(
+                        float(
+                            alert.get(
+                                "base_risk",
+                                0.0
+                            )
+                        ),
+                        6
+                    )
+            },
+
+            "graph_features": {
+                "graph_date":
+                    graph_date_str,
+
+                "graph_penalty":
+                    round(
+                        float(
+                            alert.get(
+                                "graph_penalty",
+                                0.0
+                            )
+                        ),
+                        6
+                    ),
+
+                "is_high_risk_seed":
+                    bool(
+                        alert.get(
+                            "is_high_risk_seed",
+                            False
+                        )
+                    ),
+
+                "received_from_high_risk":
+                    bool(
+                        alert.get(
+                            "received_from_high_risk",
+                            False
+                        )
+                    ),
+
+                "investigation_flag":
+                    bool(
+                        alert.get(
+                            "investigation_flag",
+                            False
+                        )
+                    ),
+            },
+
+            "transactions":
+                transactions,
         }
+
         try:
-            generated_text = generate_report(structured_case)
+            generated_text = generate_report(
+                structured_case
+            )
+
         except Exception as e:
-            print(f"⚠️ LLM generation failed for {alert['Account']}: {e}")
-            generated_text = f"SYSTEM ERROR: Failed to generate SAR. API returned: {e}"
-            
-        sar_reports.append(generated_text)
+            print(
+                f"⚠️ SAR generation failed "
+                f"for {account}: {e}"
+            )
 
-    print(f"✅ Successfully generated {len(sar_reports)} SAR drafts via OpenRouter.")
+            generated_text = (
+                "SYSTEM ERROR: "
+                "Failed to generate SAR. "
+                f"{e}"
+            )
+
+        sar_reports.append(
+            generated_text
+        )
+
+    print(
+        f"✅ Generated "
+        f"{len(sar_reports):,} "
+        "account/day SAR drafts."
+    )
+
     return {
-        "sar_reports": sar_reports, 
-        "final_insights": alerts
+        "sar_reports": sar_reports,
+        "final_insights": alerts,
     }
-
 
 
 # 7. Report Node
