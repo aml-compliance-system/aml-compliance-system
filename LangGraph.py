@@ -28,9 +28,14 @@ workflow.add_edge("preprocess", "behavioral_model")
 
 
 # Fan-in: Models and Graph feed into the Risk Agent
-workflow.add_edge("xgb_model", "graph_extraction")
-workflow.add_edge("anomaly_model", "graph_extraction")
-workflow.add_edge("behavioral_model", "graph_extraction")
+workflow.add_edge(
+    [
+        "xgb_model",
+        "anomaly_model",
+        "behavioral_model"
+    ],
+    "graph_extraction"
+)
 
 
 # Sequential finish
@@ -50,7 +55,7 @@ if __name__ == "__main__":
     
     # 1. Define the starting state
     initial_state = {
-        "raw_csv_path": "input/unlabeled_transactions.csv"
+        "final_parquet_path": "input/final_transactions_10k.parquet"
     }
     
     # 2. Execute the workflow
@@ -58,29 +63,94 @@ if __name__ == "__main__":
     
     print("\n=== PIPELINE EXECUTION COMPLETE ===")
     
-    # 3. Print Risk Scores & Labels
-    if "risk_scores" in final_state and "final_insights" in final_state:
-        # Extracting the key columns to display cleanly
-        df_results = final_state["risk_scores"][["Account", "Account_duplicated_0", "final_risk_score", "risk_label"]]
-        
-        # Print a sample of High Risk accounts if any exist, otherwise just print the top 5
-        high_risk_sample = df_results[df_results['risk_label'] == 'High Risk']
-        
+    # 3. Print Account/Day Risk Results
+    if "risk_scores" in final_state:
+
+        df_results = final_state["risk_scores"][
+            [
+                "graph_date",
+                "Account",
+                "base_risk",
+                "graph_penalty",
+                "final_risk_score",
+                "is_high_risk_seed",
+                "received_from_high_risk",
+                "investigation_flag",
+                "risk_label",
+            ]
+        ].copy()
+
+        df_results = df_results.sort_values(
+            "final_risk_score",
+            ascending=False
+        )
+
+        high_risk_sample = df_results[
+            df_results["risk_label"] == "High Risk"
+        ]
+
         if not high_risk_sample.empty:
-            print(f"\n🚨 Found {len(high_risk_sample)} High Risk Alerts. Showing sample:")
-            print(high_risk_sample.head(5).to_string(index=False))
+
+            print(
+                f"\\n🚨 Found "
+                f"{len(high_risk_sample):,} "
+                "High Risk account/day cases."
+            )
+
+            print("\\n--- TOP HIGH-RISK CASES ---")
+
+            print(
+                high_risk_sample
+                .head(10)
+                .to_string(index=False)
+            )
+
         else:
-            print("\n✅ No High Risk alerts found. Showing first 5 transactions in batch:")
-            print(df_results.head(5).to_string(index=False))
+
+            print(
+                "\\n✅ No accounts crossed the "
+                "investigation threshold."
+            )
+
+            print(
+                df_results
+                .head(10)
+                .to_string(index=False)
+            )
+
     else:
-        print("❌ Failed to retrieve risk scores.")
-        
-    # 4. Print LLM SAR Reports
-    if "sar_reports" in final_state and final_state["sar_reports"]:
-        reports = final_state["sar_reports"]
-        print(f"\n📝 LLM Success: Generated {len(reports)} SAR drafts.")
-        print("\n--- SAMPLE SAR REPORT ---")
+        print(
+            "❌ Failed to retrieve risk scores."
+        )
+
+    # 4. Print SAR Report Summary
+    reports = final_state.get(
+        "sar_reports",
+        []
+    )
+
+    if reports:
+
+        print(
+            f"\\n📝 Generated "
+            f"{len(reports):,} "
+            "SAR draft(s)."
+        )
+
+        print(
+            "\\n--- SAMPLE SAR REPORT ---"
+        )
+
         print(reports[0])
-        print("-------------------------\n")
+
+        print(
+            "-------------------------\\n"
+        )
+
     else:
-        print("\n✅ Pipeline finished safely. No SARs generated (no transactions crossed the 0.55 threshold).")
+
+        print(
+            "\\n✅ Pipeline finished safely. "
+            "No account/day cases crossed "
+            "the 0.50 investigation threshold."
+        )
