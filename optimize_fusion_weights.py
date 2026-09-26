@@ -122,10 +122,14 @@ def optimize(df, n_iter=60, target_min=0.85, target_max=0.90, seed=42, objective
     best_config = None
 
     for i in range(n_iter):
-        xgb_w, anomaly_w, behavioral_w = rng.dirichlet([1, 1, 1])
+        xgb_w = rng.uniform(0.40, 0.60)       # Force XGB to be 40-60%
+        anomaly_w = rng.uniform(0.20, 0.40)   # Force Anomaly to be 20-40%
+        behavioral_w = 1.0 - xgb_w - anomaly_w
+        if behavioral_w < 0.10: 
+            continue
         seed_threshold = rng.uniform(0.25, 0.55)
-        direct_penalty = rng.uniform(0.10, 0.35)
-        indirect_penalty = rng.uniform(0.02, 0.10)
+        direct_penalty = rng.uniform(0.10, 0.45)
+        indirect_penalty = rng.uniform(0.02, 0.30)
 
         account_results = run_fusion(df, xgb_w, anomaly_w, behavioral_w, seed_threshold, direct_penalty, indirect_penalty)
         result = evaluate_candidate(df, account_results, target_min, target_max, objective=objective)

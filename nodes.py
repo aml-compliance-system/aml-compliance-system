@@ -110,8 +110,7 @@ def run_xgboost_model(state: dict) -> dict:
         # --- OPTIMIZATION: Non-linear boosting for imbalanced AML data ---
         # Scale raw probabilities to give a sharper separation between normal and illicit transactions
         # Using a power curve (0.4) lifts suppressed probabilities into actionable decision ranges
-        probabilities = np.power(np.clip(raw_probabilities * 3.5, 0.0, 1.0), 0.4)
-        probabilities = np.clip(probabilities, 0.0, 1.0)
+        probabilities = np.clip(raw_probabilities * 1.2, 0.0, 1.0)
  
         print(
             "Optimized XGBoost scoring complete | rows=%s | min=%.6f | mean=%.6f | max=%.6f",
@@ -748,8 +747,8 @@ def evaluation_node(state: dict) -> dict:
         best_config, best_result = optimize(
             search_half, 
             n_iter=200, 
-            target_min=0.80, 
-            target_max=0.85, 
+            target_min=0.70, 
+            target_max=0.75, 
             objective="precision"
         )
 
