@@ -58,17 +58,17 @@ DEFAULT_PARQUET_PATH = Path(
 # ---------------------------------------------------------------
 # Risk fusion weights (must sum to 1.0)
 # ---------------------------------------------------------------
-XGB_WEIGHT = float(os.environ.get("FINDETECT_XGB_WEIGHT", 0.591))
-ANOMALY_WEIGHT = float(os.environ.get("FINDETECT_ANOMALY_WEIGHT", 0.214))
-BEHAVIORAL_WEIGHT = float(os.environ.get("FINDETECT_BEHAVIORAL_WEIGHT", 0.195))
+XGB_WEIGHT = float(os.environ.get("FINDETECT_XGB_WEIGHT", 0.30 ))
+ANOMALY_WEIGHT = float(os.environ.get("FINDETECT_ANOMALY_WEIGHT", 0.40))
+BEHAVIORAL_WEIGHT = float(os.environ.get("FINDETECT_BEHAVIORAL_WEIGHT", 0.30 ))
  
 # ---------------------------------------------------------------
 # Behavioral model sub-weights (must sum to 1.0)
 # ---------------------------------------------------------------
-AMOUNT_DRIFT_WEIGHT = float(os.environ.get("FINDETECT_AMOUNT_DRIFT_WEIGHT", 0.30))
-FREQUENCY_DRIFT_WEIGHT = float(os.environ.get("FINDETECT_FREQUENCY_DRIFT_WEIGHT", 0.30))
-PEER_GROUP_WEIGHT = float(os.environ.get("FINDETECT_PEER_GROUP_WEIGHT", 0.20))
-VELOCITY_WEIGHT = float(os.environ.get("FINDETECT_VELOCITY_WEIGHT", 0.20))
+AMOUNT_DRIFT_WEIGHT = float(os.environ.get("FINDETECT_AMOUNT_DRIFT_WEIGHT", 0.35))
+FREQUENCY_DRIFT_WEIGHT = float(os.environ.get("FINDETECT_FREQUENCY_DRIFT_WEIGHT", 0.25))
+PEER_GROUP_WEIGHT = float(os.environ.get("FINDETECT_PEER_GROUP_WEIGHT", 0.25))
+VELOCITY_WEIGHT = float(os.environ.get("FINDETECT_VELOCITY_WEIGHT", 0.15))
  
 MIN_PEER_GROUP_SIZE = int(os.environ.get("FINDETECT_MIN_PEER_GROUP_SIZE", 20))
 ROBUST_Z_SATURATION = float(os.environ.get("FINDETECT_ROBUST_Z_SATURATION", 5.0))
@@ -77,10 +77,10 @@ MAD_SCALE_FACTOR = 1.4826  # constant: converts MAD to a normal-equivalent std d
 # ---------------------------------------------------------------
 # Graph / investigation thresholds
 # ---------------------------------------------------------------
-SEED_THRESHOLD = float(os.environ.get("FINDETECT_SEED_THRESHOLD", 0.291))
-GRAPH_RECEIVING_PENALTY = float(os.environ.get("FINDETECT_GRAPH_PENALTY", 0.207))
-GRAPH_INDIRECT_PENALTY = float(os.environ.get("FINDETECT_INDIRECT_PENALTY", 0.175))  # NEW
-INVESTIGATION_THRESHOLD = float(os.environ.get("FINDETECT_INVESTIGATION_THRESHOLD", 0.255))
+SEED_THRESHOLD = float(os.environ.get("FINDETECT_SEED_THRESHOLD", 0.45))
+GRAPH_RECEIVING_PENALTY = float(os.environ.get("FINDETECT_GRAPH_PENALTY", 0.3046))
+GRAPH_INDIRECT_PENALTY = float(os.environ.get("FINDETECT_INDIRECT_PENALTY", 0.0555))  # NEW
+INVESTIGATION_THRESHOLD = float(os.environ.get("FINDETECT_INVESTIGATION_THRESHOLD", 0.33))
 MEDIUM_RISK_THRESHOLD = float(os.environ.get("FINDETECT_MEDIUM_RISK_THRESHOLD", 0.30))
 # ---------------------------------------------------------------
 # LLM chat settings (used by main.py's /chat endpoint)

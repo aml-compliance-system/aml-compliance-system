@@ -1,54 +1,78 @@
 from langgraph.graph import StateGraph, END
+
+# Import the correctly defined state with the merge_dicts reducer
 from AMLPipelineState import AMLPipelineState
+
 from nodes import (
     preprocessing_node,
+    customer_deviation_node,    
     run_xgboost_model,
     run_anomaly_model,
     run_behavioral_model,
     graph_context_node,
+    meta_learner_node,         
     risk_agent_node,
     llm_api_node,
     report_node,
     evaluation_node,
 )
+
+# ✅ CORRECT: Initialize with your custom state (DO NOT overwrite this with 'dict')
 workflow = StateGraph(AMLPipelineState)
 
-# 1. Add Nodes
+# ============================================================================
+# 1. ADD NODES
+# ============================================================================
 workflow.add_node("preprocess", preprocessing_node)
+workflow.add_node("customer_deviation", customer_deviation_node)   
 workflow.add_node("xgb_model", run_xgboost_model)
 workflow.add_node("anomaly_model", run_anomaly_model)
 workflow.add_node("behavioral_model", run_behavioral_model)
-
 workflow.add_node("graph_extraction", graph_context_node)
+workflow.add_node("meta_learner", meta_learner_node)               
 workflow.add_node("risk_agent", risk_agent_node)
 workflow.add_node("llm_api", llm_api_node)
 workflow.add_node("report", report_node)
 workflow.add_node("evaluation", evaluation_node)
 
-
-# 2
+# ============================================================================
+# 2. SET ENTRY POINT
+# ============================================================================
 workflow.set_entry_point("preprocess")
 
-# Fan-out: Preprocessing feeds into all three models simultaneously
-workflow.add_edge("preprocess", "xgb_model")
-workflow.add_edge("preprocess", "anomaly_model")
-workflow.add_edge("preprocess", "behavioral_model")
+# ============================================================================
+# 3. DEFINE EDGES (Parallel Fan-Out / Fan-In)
+# ============================================================================
 
-# Fan-in: Explicitly route each model into graph extraction
+# Step 1: Preprocess → Customer Deviation (sequential, must run first)
+workflow.add_edge("preprocess", "customer_deviation")              
+
+# Step 2: Customer Deviation → Fan-out to all 3 models (parallel execution)
+workflow.add_edge("customer_deviation", "xgb_model")               
+workflow.add_edge("customer_deviation", "anomaly_model")           
+workflow.add_edge("customer_deviation", "behavioral_model")        
+
+# Step 3: Fan-in from all 3 models → Graph Extraction
 workflow.add_edge("xgb_model", "graph_extraction")
 workflow.add_edge("anomaly_model", "graph_extraction")
 workflow.add_edge("behavioral_model", "graph_extraction")
 
-# Sequential finish & evaluation
-workflow.add_edge("graph_extraction", "risk_agent")
+# Step 4: Graph Extraction → Meta-Learner → Risk Agent
+workflow.add_edge("graph_extraction", "meta_learner")              
+workflow.add_edge("meta_learner", "risk_agent")                    
+
+# Step 5: Sequential finish & evaluation
 workflow.add_edge("risk_agent", "llm_api")
 workflow.add_edge("llm_api", "report")
-workflow.add_edge("report", "evaluation")  
+workflow.add_edge("report", "evaluation")
 workflow.add_edge("evaluation", END)
 
+# ============================================================================
+# 4. COMPILE
+# ============================================================================
 app = workflow.compile()
 
-
+print("✅ AML Pipeline compiled successfully with parallel execution and meta-learner!")
 
 
 

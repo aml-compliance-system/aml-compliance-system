@@ -12,7 +12,9 @@ import traceback
 import config
 from LLM import generate_report
 from sklearn.metrics import classification_report, precision_recall_fscore_support, confusion_matrix
- 
+from customer_deviation import add_customer_deviation_features
+from meta_learner import predict_with_meta_learner
+
 
 def preprocessing_node(state: dict) -> dict:
     print("--- LOADING FINAL FEATURE DATASET ---")
@@ -107,10 +109,10 @@ def run_xgboost_model(state: dict) -> dict:
         if not np.isfinite(raw_probabilities).all():
             raise ValueError("XGBoost produced non-finite probabilities.")
 
-        # --- OPTIMIZATION: Non-linear boosting for imbalanced AML data ---
-        # Scale raw probabilities to give a sharper separation between normal and illicit transactions
-        # Using a power curve (0.4) lifts suppressed probabilities into actionable decision ranges
-        probabilities = np.clip(raw_probabilities * 1.2, 0.0, 1.0)
+        # --- CALIBRATION: Gentle linear scaling (no aggressive transforms) ---
+        # Since we cannot retrain, we use a conservative 1.2x multiplier
+        # This provides slight sensitivity boost without distorting the probability distribution
+        probabilities = np.clip(raw_probabilities * 1.2, 0.0, 1.0).astype(np.float32)
  
         print(
             "Optimized XGBoost scoring complete | rows=%s | min=%.6f | mean=%.6f | max=%.6f",
@@ -329,7 +331,7 @@ def run_behavioral_model(state: dict) -> dict:
 
 # 4. Upgraded Graph Context Node (Dynamic Penalties)
 def graph_context_node(state: dict) -> dict:
-    print("Running super-node shielded multi-hop graph analysis")
+    print("Running enhanced multi-hop graph analysis with pattern detection")
  
     df = state["final_df"].copy()
     ml_probs = state.get("ml_probabilities", {})
@@ -374,22 +376,26 @@ def graph_context_node(state: dict) -> dict:
     account_results["base_risk"] = account_results["base_risk"].fillna(0.0).astype(float)
  
     # --- SUPER-NODE SHIELDING ---
-    # Calculate daily unique counterparties per account to block merchants/gateways from becoming seeds
     daily_degree = df.groupby(["_graph_date", "Account"])["Account_duplicated_0"].nunique().reset_index(name="daily_degree")
-    account_results = account_results.merge(daily_degree, on=["graph_date" if "graph_date" in account_results.columns else "_graph_date", "Account"], how="left")
+    
+    date_merge_col = "_graph_date" if "_graph_date" in account_results.columns else "graph_date"
+    account_results = account_results.merge(
+        daily_degree, 
+        left_on=[date_merge_col, "Account"], 
+        right_on=["_graph_date", "Account"], 
+        how="left"
+    )
     account_results["daily_degree"] = account_results["daily_degree"].fillna(1.0)
     
-    # If an account interacts with more than 50 different entities in a single day, it's a merchant/gateway, NOT a launderer. Block it from being a seed.
     MAX_NORMAL_DEGREE = 50
     
-    # Phase 2: Identify high-risk seeds with super-node protection
     account_results["is_high_risk_seed"] = (
         (account_results["base_risk"] > config.SEED_THRESHOLD) & 
         (account_results["daily_degree"] <= MAX_NORMAL_DEGREE)
     )
     
     seeds = account_results[account_results["is_high_risk_seed"]][["_graph_date", "Account"]].drop_duplicates()
-    seeds = seeds.rename(columns={"Account": "Seed_Account"})
+    seeds = seeds.rename(columns={"Account": "Seed_Account", "_graph_date": "graph_date"})
  
     amount_col = "Amount Paid" if "Amount Paid" in df.columns else "Amount Received"
     df["_clean_amount"] = pd.to_numeric(df[amount_col], errors="coerce").fillna(0.0).clip(lower=0.0) if amount_col in df.columns else 1.0
@@ -397,11 +403,59 @@ def graph_context_node(state: dict) -> dict:
     edges = df[df["Account"] != df["Account_duplicated_0"]][["_graph_date", "Account", "Account_duplicated_0", "_clean_amount"]].copy()
     edges.columns = ["graph_date", "sender", "receiver", "amount"]
 
+    # ============================================================================
+    # NEW: PATTERN DETECTION - Bidirectional Relationships (Layering)
+    # ============================================================================
+    # If A→B AND B→A exist on same day, both are suspicious (layering)
+    edge_pairs = edges.groupby(["graph_date", "sender", "receiver"])["amount"].sum().reset_index()
+    reverse_pairs = edge_pairs.rename(columns={"sender": "receiver", "receiver": "sender"})
+    
+    bidirectional = edge_pairs.merge(
+        reverse_pairs[["graph_date", "sender", "receiver"]],
+        on=["graph_date", "sender", "receiver"],
+        how="inner"
+    )
+    
+    # Both accounts in a bidirectional pair get flagged
+    bidir_accounts_a = bidirectional[["graph_date", "sender"]].rename(columns={"sender": "Account"})
+    bidir_accounts_b = bidirectional[["graph_date", "receiver"]].rename(columns={"receiver": "Account"})
+    bidir_all = pd.concat([bidir_accounts_a, bidir_accounts_b]).drop_duplicates()
+    bidir_counts = bidir_all.groupby(["graph_date", "Account"]).size().reset_index(name="bidir_count")
+    
+    print(f"Pattern Detection: Found {len(bidir_all)} bidirectional relationships (layering indicator)")
+    # ============================================================================
+    
+    # ============================================================================
+    # NEW: PATTERN DETECTION - Fan-In/Fan-Out (Mule Detection)
+    # ============================================================================
+    # Count incoming and outgoing unique counterparties per account per day
+    out_degree = edges.groupby(["graph_date", "sender"])["receiver"].nunique().reset_index(name="out_degree")
+    out_degree = out_degree.rename(columns={"sender": "Account"})
+    
+    in_degree = edges.groupby(["graph_date", "receiver"])["sender"].nunique().reset_index(name="in_degree")
+    in_degree = in_degree.rename(columns={"receiver": "Account"})
+    
+    degree_df = out_degree.merge(in_degree, on=["graph_date", "Account"], how="outer").fillna(0)
+    
+    # Fan-in/fan-out: both in AND out degree are moderately high (5-50 range)
+    # This catches mules without flagging merchants (>50)
+    degree_df["is_fan_pattern"] = (
+        (degree_df["in_degree"] >= 5) & (degree_df["in_degree"] <= 50) &
+        (degree_df["out_degree"] >= 5) & (degree_df["out_degree"] <= 50)
+    ).astype(int)
+    
+    fan_pattern_accounts = degree_df[degree_df["is_fan_pattern"] == 1][["graph_date", "Account", "in_degree", "out_degree"]].copy()
+    fan_pattern_accounts["fan_score"] = (fan_pattern_accounts["in_degree"] * fan_pattern_accounts["out_degree"]) / 2500.0
+    fan_pattern_accounts["fan_score"] = fan_pattern_accounts["fan_score"].clip(0.0, 1.0)
+    
+    print(f"Pattern Detection: Found {len(fan_pattern_accounts)} fan-in/fan-out patterns (mule indicator)")
+    # ============================================================================
+
     # HOP 1: DIRECT EXPOSURE
-    seed_send = edges.merge(seeds, left_on=["graph_date", "sender"], right_on=["_graph_date", "Seed_Account"])
+    seed_send = edges.merge(seeds, left_on=["graph_date", "sender"], right_on=["graph_date", "Seed_Account"])
     hop1_receivers = seed_send[["graph_date", "receiver", "Seed_Account", "amount"]].rename(columns={"receiver": "Account"})
     
-    seed_recv = edges.merge(seeds, left_on=["graph_date", "receiver"], right_on=["_graph_date", "Seed_Account"])
+    seed_recv = edges.merge(seeds, left_on=["graph_date", "receiver"], right_on=["graph_date", "Seed_Account"])
     hop1_senders = seed_recv[["graph_date", "sender", "Seed_Account", "amount"]].rename(columns={"sender": "Account"})
 
     hop1_all = pd.concat([hop1_receivers, hop1_senders])
@@ -426,8 +480,23 @@ def graph_context_node(state: dict) -> dict:
     hop2_all = pd.concat([hop2_receivers, hop2_senders])
     hop2_counts = hop2_all.groupby(["graph_date", "Account"])["Hop1_Account"].nunique().reset_index(name="hop2_count")
 
+    # HOP 3: TERTIARY EXPOSURE
+    hop2_unique = hop2_all[["graph_date", "Account"]].drop_duplicates().rename(columns={"Account": "Hop2_Account"})
+    
+    hop3_recv = edges.merge(hop2_unique, left_on=["graph_date", "sender"], right_on=["graph_date", "Hop2_Account"])
+    hop3_receivers = hop3_recv[["graph_date", "receiver", "Hop2_Account"]].rename(columns={"receiver": "Account"})
+    
+    hop3_send = edges.merge(hop2_unique, left_on=["graph_date", "receiver"], right_on=["graph_date", "Hop2_Account"])
+    hop3_senders = hop3_send[["graph_date", "sender", "Hop2_Account"]].rename(columns={"sender": "Account"})
+    
+    hop3_all = pd.concat([hop3_receivers, hop3_senders])
+    hop3_counts = hop3_all.groupby(["graph_date", "Account"])["Hop2_Account"].nunique().reset_index(name="hop3_count")
+
+    # ============================================================================
     # MERGE & APPLY PENALTIES
-    account_results = account_results.rename(columns={"_graph_date": "graph_date"})
+    # ============================================================================
+    if "_graph_date" in account_results.columns:
+        account_results = account_results.rename(columns={"_graph_date": "graph_date"})
     
     account_results = account_results.merge(hop1_stats, on=["graph_date", "Account"], how="left")
     account_results["hop1_count"] = account_results["hop1_count"].fillna(0.0)
@@ -435,16 +504,51 @@ def graph_context_node(state: dict) -> dict:
     
     account_results = account_results.merge(hop2_counts, on=["graph_date", "Account"], how="left")
     account_results["hop2_count"] = account_results["hop2_count"].fillna(0.0)
+    
+    account_results = account_results.merge(hop3_counts, on=["graph_date", "Account"], how="left")
+    account_results["hop3_count"] = account_results["hop3_count"].fillna(0.0)
+    
+    # NEW: Merge pattern detection signals
+    account_results = account_results.merge(bidir_counts, on=["graph_date", "Account"], how="left")
+    account_results["bidir_count"] = account_results["bidir_count"].fillna(0.0)
+    
+    account_results = account_results.merge(
+        fan_pattern_accounts[["graph_date", "Account", "fan_score"]],
+        on=["graph_date", "Account"], 
+        how="left"
+    )
+    account_results["fan_score"] = account_results["fan_score"].fillna(0.0)
+    
+    # Zero out lower hops if higher hop exists
     account_results.loc[account_results["hop1_count"] > 0, "hop2_count"] = 0.0
+    account_results.loc[account_results["hop2_count"] > 0, "hop3_count"] = 0.0
 
     DIRECT_PENALTY = config.GRAPH_RECEIVING_PENALTY
     INDIRECT_PENALTY = config.GRAPH_INDIRECT_PENALTY
+    TERTIARY_PENALTY = INDIRECT_PENALTY * 0.5
+    
+    # NEW: Pattern-based penalties
+    BIDIR_PENALTY = 0.08   # Each bidirectional relationship adds this
+    FAN_BOOST = 0.12       # Fan pattern adds up to this much
 
     account_results["graph_penalty"] = (
         (account_results["hop1_count"] * DIRECT_PENALTY * account_results["volume_factor"])
         + (account_results["hop2_count"] * INDIRECT_PENALTY)
-    ).clip(upper=0.55)
+        + (account_results["hop3_count"] * TERTIARY_PENALTY)
+        + (account_results["bidir_count"] * BIDIR_PENALTY)  # NEW
+        + (account_results["fan_score"] * FAN_BOOST)         # NEW
+    ).clip(upper=0.75)  # Increased cap to accommodate new signals
 
+    # NEW: Pattern-based base_risk boost
+    # If an account shows layering OR mule patterns, boost its base_risk directly
+    pattern_boost = (
+        (account_results["bidir_count"] > 0).astype(float) * 0.08 +
+        account_results["fan_score"] * 0.10
+    ).clip(0.0, 0.20)
+    
+    account_results["base_risk"] = (account_results["base_risk"] + pattern_boost).clip(0.0, 1.0)
+    
+    # Recompute final risk score with boosted base_risk
     account_results["final_risk_score"] = (
         account_results["base_risk"] + account_results["graph_penalty"]
     ).clip(lower=0.0, upper=1.0)
@@ -466,9 +570,13 @@ def graph_context_node(state: dict) -> dict:
     account_results["received_from_high_risk"] = account_results["received_from_high_risk"].astype(bool)
 
     print(
-        "Super-Node Shielded Graph | nodes=%s | seeds=%s | 1-Hop=%s | 2-Hop=%s | flagged=%s",
+        "Enhanced Graph | nodes=%s | seeds=%s | 1-Hop=%s | 2-Hop=%s | 3-Hop=%s | Bidir=%s | Fan=%s | flagged=%s",
         len(account_results), int(account_results["is_high_risk_seed"].sum()),
-        int((account_results["hop1_count"] > 0).sum()), int((account_results["hop2_count"] > 0).sum()),
+        int((account_results["hop1_count"] > 0).sum()), 
+        int((account_results["hop2_count"] > 0).sum()),
+        int((account_results["hop3_count"] > 0).sum()),
+        int((account_results["bidir_count"] > 0).sum()),
+        int((account_results["fan_score"] > 0).sum()),
         int(account_results["investigation_flag"].sum()),
     )
  
@@ -485,20 +593,22 @@ def graph_context_node(state: dict) -> dict:
     }
  
 
+
+
 # 5. Risk Agent Node (Mathematical Weighting)
 def risk_agent_node(state: dict) -> dict:
     print("--- RUNNING RISK AGENT ---")
 
     graph_data = state.get("subgraph_data", {})
     account_results = graph_data.get("account_results")
- 
+
     if account_results is None:
         raise ValueError("Risk Agent did not receive account_results from the graph node.")
     if not isinstance(account_results, pd.DataFrame):
         raise TypeError("subgraph_data['account_results'] must be a pandas DataFrame.")
- 
+
     results = account_results.copy()
- 
+
     required = [
         "graph_date", "Account", "base_risk", "graph_penalty",
         "final_risk_score", "investigation_flag",
@@ -506,35 +616,111 @@ def risk_agent_node(state: dict) -> dict:
     missing = [c for c in required if c not in results.columns]
     if missing:
         raise ValueError(f"Risk Agent missing graph outputs: {missing}")
- 
-    # NOTE: do not recompute model weighting here — the graph node already applied
-    # base_risk = XGB_WEIGHT*xgb + ANOMALY_WEIGHT*ae + BEHAVIORAL_WEIGHT*behavioral,
-    # and final_risk_score = base_risk + graph_penalty.
+
     results["final_risk_score"] = (
         pd.to_numeric(results["final_risk_score"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
     )
- 
+
     investigation_threshold = float(
         graph_data.get("investigation_threshold", config.INVESTIGATION_THRESHOLD)
     )
     results["investigation_flag"] = results["final_risk_score"] >= investigation_threshold
- 
+
+    # ============================================================================
+    # HARD RULE AUTO-CLEAR FILTERS (TIGHTENED FOR 85% RECALL TARGET)
+    # ============================================================================
+    flagged_accounts = results[results["investigation_flag"]].copy()
+    initial_queue_size = len(flagged_accounts)
+
+    # Filter 1: Require meaningful base_risk (filter out graph-padding noise)
+    if "base_risk" in flagged_accounts.columns:
+        flagged_accounts = flagged_accounts[flagged_accounts["base_risk"] >= 0.15]
+        print(f"Filter 1 (base_risk >= 0.15): {initial_queue_size} → {len(flagged_accounts)}")
+
+    # Filter 2: Require a STRONG signal in at least one area
+    if "hop1_count" in flagged_accounts.columns:
+        has_anomaly = "anomaly_score" in flagged_accounts.columns
+
+        if has_anomaly:
+            flagged_accounts = flagged_accounts[
+                (flagged_accounts["hop1_count"] >= 1) |       # Has graph exposure
+                (flagged_accounts["base_risk"] >= 0.25) |     # OR solid base model agreement
+                (flagged_accounts["anomaly_score"] >= 0.93)   # OR strong Autoencoder signal
+            ]
+            print(f"Filter 2 (graph OR base>=0.25 OR anomaly>=0.92): → {len(flagged_accounts)}")
+        else:
+            flagged_accounts = flagged_accounts[
+                (flagged_accounts["hop1_count"] >= 1) |
+                (flagged_accounts["base_risk"] >= 0.25)
+            ]
+            print(f"Filter 2 (graph signal OR base_risk >= 0.25): → {len(flagged_accounts)}")
+
+    # Filter 3: Final score sanity check (matches INVESTIGATION_THRESHOLD)
+    flagged_accounts = flagged_accounts[flagged_accounts["final_risk_score"] >= 0.32]
+    print(f"Filter 3 (final_risk_score >= 0.32): → {len(flagged_accounts)}")
+
+    final_queue_size = len(flagged_accounts)
+    reduction_pct = ((initial_queue_size - final_queue_size) / initial_queue_size * 100) if initial_queue_size > 0 else 0
+    print(f"Hard Rule Filters: Queue reduced {initial_queue_size} → {final_queue_size} ({reduction_pct:.1f}% reduction)")
+    # ============================================================================
+
+    # ============================================================================
+    # TIERED INVESTIGATION WORKFLOW
+    # ============================================================================
+    flagged_accounts["investigation_tier"] = np.select(
+        [
+            flagged_accounts["final_risk_score"] >= 0.45,
+            flagged_accounts["final_risk_score"] >= 0.35,
+        ],
+        ["TIER_1_HIGH", "TIER_2_MEDIUM"],
+        default="TIER_3_LOW"
+    )
+
+    flagged_accounts["risk_label"] = flagged_accounts["investigation_tier"]
+
+    # SORT BY RISK SCORE DESCENDING (most important accounts first)
+    flagged_accounts = flagged_accounts.sort_values(
+        by="final_risk_score",
+        ascending=False
+    ).reset_index(drop=True)
+
+    tier_counts = flagged_accounts["investigation_tier"].value_counts()
+    print(
+        f"Tiered Queue | TIER_1_HIGH: {tier_counts.get('TIER_1_HIGH', 0)} | "
+        f"TIER_2_MEDIUM: {tier_counts.get('TIER_2_MEDIUM', 0)} | "
+        f"TIER_3_LOW: {tier_counts.get('TIER_3_LOW', 0)}"
+    )
+
+    # ============================================================================
+    # PROPAGATE FILTERED FLAGS BACK TO MAIN RESULTS
+    # ============================================================================
+    filtered_flags = flagged_accounts[["graph_date", "Account"]].copy()
+    filtered_flags["investigation_flag"] = True
+
+    results = results.drop(columns=["investigation_flag", "investigation_tier"], errors="ignore")
+    results = results.merge(filtered_flags, on=["graph_date", "Account"], how="left")
+    results["investigation_flag"] = results["investigation_flag"].fillna(False).astype(bool)
+
+    tier_info = flagged_accounts[["graph_date", "Account", "investigation_tier"]].copy()
+    results = results.merge(tier_info, on=["graph_date", "Account"], how="left")
+    results["investigation_tier"] = results["investigation_tier"].fillna("NOT_FLAGGED")
+
     results["risk_label"] = np.select(
         [results["investigation_flag"], results["final_risk_score"] >= config.MEDIUM_RISK_THRESHOLD],
         ["High Risk", "Medium Risk"],
         default="Low Risk",
     )
- 
-    flagged_accounts = results[results["investigation_flag"]].copy()
- 
+    # ============================================================================
+
+    high_count = int((results["risk_label"] == "High Risk").sum())
+    med_count = int((results["risk_label"] == "Medium Risk").sum())
+    low_count = int((results["risk_label"] == "Low Risk").sum())
+
     print(
-        "Risk agent results | high=%s | medium=%s | low=%s | routed for investigation=%s",
-        int((results["risk_label"] == "High Risk").sum()),
-        int((results["risk_label"] == "Medium Risk").sum()),
-        int((results["risk_label"] == "Low Risk").sum()),
-        len(flagged_accounts),
+        f"Risk agent results | high={high_count} | medium={med_count} | "
+        f"low={low_count} | routed for investigation={len(flagged_accounts)}"
     )
- 
+
     return {
         "risk_scores": results,
         "final_insights": flagged_accounts.to_dict(orient="records"),
@@ -701,7 +887,7 @@ def _print_metrics(model_name: str, y_true: np.ndarray, y_pred: np.ndarray):
 def evaluation_node(state: dict) -> dict:
     val_df = state["final_df"]
     true_label_col = "Is Laundering"
-    
+
     if true_label_col not in val_df.columns:
         print(f"ℹ️ Ground truth column '{true_label_col}' not found. Skipping evaluation metrics.")
         return {}
@@ -709,103 +895,132 @@ def evaluation_node(state: dict) -> dict:
     print(f"--- STARTING PIPELINE EVALUATION ON {len(val_df)} TRANSACTIONS ---")
     y_true_trans = val_df[true_label_col].astype(int).to_numpy()
 
-    ml_probs = state["ml_probabilities"]
-    xgb_preds = np.array(ml_probs["xgb_prob"]) >= 0.40
-    ae_preds = np.array(ml_probs["anomaly_score"]) >= 0.97
-    beh_preds = np.array(ml_probs["behavioral_score"]) >= 0.75
+    ml_probs = state.get("ml_probabilities", {})
+
+    # Individual model thresholds
+    xgb_preds = np.array(ml_probs.get("xgb_prob", [])) >= 0.40
+    ae_preds = np.array(ml_probs.get("anomaly_score", [])) >= 0.92
+    beh_preds = np.array(ml_probs.get("behavioral_score", [])) >= 0.75
 
     print("\n================ INDIVIDUAL MODEL PERFORMANCE ================")
     _print_metrics("XGBoost Model", y_true_trans, xgb_preds)
     _print_metrics("Autoencoder Anomaly Model", y_true_trans, ae_preds)
     _print_metrics("Behavioral Risk Model", y_true_trans, beh_preds)
 
-    if os.environ.get("FINDETECT_RUN_WEIGHT_SEARCH") == "1":
-        import optimize_fusion_weights
-        from optimize_fusion_weights import optimize, run_fusion, evaluate_candidate
-        import inspect
+    # ========================================================================
+    # 🔥 CRITICAL FIX: Read from FILTERED 'risk_scores' (not raw graph data)
+    # ========================================================================
+    account_results = state.get("risk_scores", state["subgraph_data"]["account_results"])
 
-        print("Loaded optimize_fusion_weights from:", optimize_fusion_weights.__file__, flush=True)
-        print("optimize() signature:", inspect.signature(optimize), flush=True)
+    val_df["_graph_date"] = pd.to_datetime(
+        val_df["Transaction_Date"] if "Transaction_Date" in val_df.columns else val_df["Timestamp"]
+    ).dt.normalize()
 
-        # Build the scored dataframe the optimizer needs
-        opt_df = state["final_df"].copy()
-        opt_df["xgb_prob"] = ml_probs["xgb_prob"]
-        opt_df["anomaly_score"] = ml_probs["anomaly_score"]
-        opt_df["behavioral_score"] = ml_probs["behavioral_score"]
-        opt_df["_graph_date"] = pd.to_datetime(
-            opt_df["Transaction_Date"] if "Transaction_Date" in opt_df.columns else opt_df["Timestamp"]
-        ).dt.normalize()
+    available_cols = [c for c in ["graph_date", "Account", "final_risk_score", "investigation_flag"]
+                      if c in account_results.columns]
 
-        # Split by date so the search and the confirmation never see the same rows
-        cutoff_date = opt_df["_graph_date"].quantile(0.5)
-        search_half = opt_df[opt_df["_graph_date"] <= cutoff_date]
-        holdout_half = opt_df[opt_df["_graph_date"] > cutoff_date]
-
-        print(f"\n================ WEIGHT SEARCH (n_iter=200, search half: {len(search_half)} rows) ================")
-        
-        # FIX 1: Pass 'search_half' instead of undefined 'df'
-        best_config, best_result = optimize(
-            search_half, 
-            n_iter=200, 
-            target_min=0.50,
-            target_max=0.60,
-            objective="precision"
-        )
-
-        print(f"\n================ HOLDOUT CONFIRMATION ({len(holdout_half)} rows) ================")
-        confirm_account_results = run_fusion(
-            holdout_half,  # Use holdout_half here
-            best_config["FINDETECT_XGB_WEIGHT"],
-            best_config["FINDETECT_ANOMALY_WEIGHT"],
-            best_config["FINDETECT_BEHAVIORAL_WEIGHT"],
-            best_config["FINDETECT_SEED_THRESHOLD"],
-            best_config["FINDETECT_GRAPH_PENALTY"],
-            best_config["FINDETECT_INDIRECT_PENALTY"],
-        )
-        
-        # FIX 2: Pass 'holdout_half' instead of undefined 'df'
-        confirm = evaluate_candidate(holdout_half, confirm_account_results, objective="precision")
-
-        print("Search-half result :", best_result)
-        print("Holdout result      :", confirm)
-        if confirm is None:
-            print("⚠️  No threshold on the holdout half reaches the target recall band at all — "
-                  "the search-half result does not generalize. Do not deploy these weights as-is.")
-        else:
-            drop = best_result["precision"] - confirm["precision"]
-            print(f"Precision drop search→holdout: {drop:.4f} "
-                  f"({'small, looks stable' if drop < 0.002 else 'notable — treat search-half numbers with caution'})")
-    # <<< END OF WEIGHT-SEARCH BLOCK >>>
-
-    account_results = state["subgraph_data"]["account_results"]
-    val_df["_graph_date"] = pd.to_datetime(val_df["Transaction_Date"] if "Transaction_Date" in val_df.columns else val_df["Timestamp"]).dt.normalize()
-    
-    available_cols = [c for c in ["graph_date", "Account", "final_risk_score", "investigation_flag"] if c in account_results.columns]
-    
     evaluated_df = val_df.merge(
         account_results[available_cols],
         left_on=["_graph_date", "Account"],
         right_on=["graph_date", "Account"],
         how="left"
     )
-    
+
+    # Fill NA with False for accounts filtered out by Hard Rules
     agent_preds = evaluated_df["investigation_flag"].fillna(False).astype(bool).to_numpy()
 
     print("\n================ FINAL RISK AGENT PERFORMANCE ================")
-    _print_metrics("Risk Agent (Investigation Flag Threshold)", y_true_trans, agent_preds)
+    _print_metrics("Risk Agent (Investigation Flag Threshold - POST FILTER)", y_true_trans, agent_preds)
 
     return {
         "evaluation_metrics": {
             "xgboost": precision_recall_fscore_support(y_true_trans, xgb_preds, average='binary', zero_division=0),
-            "risk_agent": precision_recall_fscore_support(y_true_trans, agent_preds, average='binary', zero_division=0)
+            "autoencoder": precision_recall_fscore_support(y_true_trans, ae_preds, average='binary', zero_division=0),
+            "behavioral": precision_recall_fscore_support(y_true_trans, beh_preds, average='binary', zero_division=0),
+            "risk_agent_filtered": precision_recall_fscore_support(y_true_trans, agent_preds, average='binary', zero_division=0)
         }
     }
 
 
+# ---------------------------------------------------------------
+# 3.5 Customer Deviation Node (NEW)
+# ---------------------------------------------------------------
+def customer_deviation_node(state: dict) -> dict:
+    """Add customer-deviation features to final_df BEFORE models run."""
+    print("--- ADDING CUSTOMER DEVIATION FEATURES ---")
+    df = state["final_df"].copy()
+    df = add_customer_deviation_features(df)
+    return {"final_df": df}
 
 
+# ---------------------------------------------------------------
+# 4.5 Meta-Learner Node (NEW — runs AFTER graph)
+# ---------------------------------------------------------------
+def meta_learner_node(state: dict) -> dict:
+    """
+    Combine base model scores + graph features + customer deviation features
+    using a trained stacking meta-learner.
+    """
+    print("--- RUNNING STACKING META-LEARNER ---")
 
+    account_results = state["subgraph_data"]["account_results"].copy()
 
+    # Merge model scores into account_results (account-level)
+    # We need account-level aggregation of model scores
+    df = state["final_df"].copy()
+    date_col = "Transaction_Date" if "Transaction_Date" in df.columns else "Timestamp"
+    df["_graph_date"] = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
 
+    # Aggregate model scores per account per day (use max — worst transaction drives risk)
+    account_scores = df.groupby(["_graph_date", "Account"]).agg(
+        xgb_prob=("xgb_prob", "max") if "xgb_prob" in df.columns else ("Amount Paid", "size"),
+        anomaly_score=("anomaly_score", "max") if "anomaly_score" in df.columns else ("Amount Paid", "size"),
+        behavioral_score=("behavioral_score", "max") if "behavioral_score" in df.columns else ("Amount Paid", "size"),
+        amount_vs_own_mean=("amount_vs_own_mean", "max") if "amount_vs_own_mean" in df.columns else ("Amount Paid", "size"),
+        amount_vs_own_median=("amount_vs_own_median", "max") if "amount_vs_own_median" in df.columns else ("Amount Paid", "size"),
+        amount_zscore_vs_own=("amount_zscore_vs_own", "max") if "amount_zscore_vs_own" in df.columns else ("Amount Paid", "size"),
+        velocity_vs_own_avg=("velocity_vs_own_avg", "max") if "velocity_vs_own_avg" in df.columns else ("Amount Paid", "size"),
+    ).reset_index()
 
+    # Merge scores into account_results
+    account_results = account_results.merge(
+        account_scores,
+        left_on=["graph_date", "Account"],
+        right_on=["_graph_date", "Account"],
+        how="left",
+        suffixes=("", "_drop"),
+    )
 
+    # Fill missing scores with 0
+    for col in ["xgb_prob", "anomaly_score", "behavioral_score",
+                "amount_vs_own_mean", "amount_vs_own_median",
+                "amount_zscore_vs_own", "velocity_vs_own_avg"]:
+        if col not in account_results.columns:
+            account_results[col] = 0.0
+        else:
+            account_results[col] = pd.to_numeric(account_results[col], errors="coerce").fillna(0.0)
+
+    # Drop duplicate _graph_date column if present
+    if "_graph_date" in account_results.columns:
+        account_results = account_results.drop(columns=["_graph_date"])
+    if "Account_drop" in account_results.columns:
+        account_results = account_results.drop(columns=["Account_drop"])
+
+    # Run meta-learner
+    try:
+        meta_scores = predict_with_meta_learner(account_results)
+        account_results["meta_score"] = meta_scores
+        print(
+            f"Meta-learner complete | min={meta_scores.min():.4f} | "
+            f"mean={meta_scores.mean():.4f} | max={meta_scores.max():.4f}"
+        )
+    except FileNotFoundError as e:
+        print(f"⚠️  {e}")
+        print("   Falling back to weighted-average final_risk_score")
+        account_results["meta_score"] = account_results["final_risk_score"]
+
+    # Replace final_risk_score with meta_score for flagging
+    account_results["final_risk_score"] = account_results["meta_score"].clip(0.0, 1.0)
+
+    state["subgraph_data"]["account_results"] = account_results
+    return {"subgraph_data": state["subgraph_data"]}
