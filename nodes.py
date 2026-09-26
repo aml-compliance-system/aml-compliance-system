@@ -747,8 +747,8 @@ def evaluation_node(state: dict) -> dict:
         best_config, best_result = optimize(
             search_half, 
             n_iter=200, 
-            target_min=0.70, 
-            target_max=0.75, 
+            target_min=0.50,
+            target_max=0.60,
             objective="precision"
         )
 
