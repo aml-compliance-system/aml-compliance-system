@@ -31,3 +31,5 @@ class AMLPipelineState(TypedDict):
 
     # Final generated SAR reports
     sar_reports: List[str]
+
+    evaluation_metrics: Dict[str, Any]

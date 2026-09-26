@@ -18,9 +18,9 @@ app = FastAPI()
 # most browsers reject it outright, so we never combine them.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=config.CORS_ALLOWED_ORIGINS,
-    allow_credentials=bool(config.CORS_ALLOWED_ORIGINS),
-    allow_methods=["*"],
+    allow_origins=["*"],  # Allows all local frontends/origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows GET, POST, OPTIONS, etc.
     allow_headers=["*"],
 )
  

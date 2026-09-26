@@ -9,6 +9,7 @@ from nodes import (
     risk_agent_node,
     llm_api_node,
     report_node,
+    evaluation_node,
 )
 workflow = StateGraph(AMLPipelineState)
 
@@ -22,33 +23,28 @@ workflow.add_node("graph_extraction", graph_context_node)
 workflow.add_node("risk_agent", risk_agent_node)
 workflow.add_node("llm_api", llm_api_node)
 workflow.add_node("report", report_node)
+workflow.add_node("evaluation", evaluation_node)
 
 
-# 2. Define Edges & Parallel Flow
+# 2
 workflow.set_entry_point("preprocess")
 
-# Fan-out: Preprocessing feeds into both models and graph context simultaneously
+# Fan-out: Preprocessing feeds into all three models simultaneously
 workflow.add_edge("preprocess", "xgb_model")
 workflow.add_edge("preprocess", "anomaly_model")
 workflow.add_edge("preprocess", "behavioral_model")
 
+# Fan-in: Explicitly route each model into graph extraction
+workflow.add_edge("xgb_model", "graph_extraction")
+workflow.add_edge("anomaly_model", "graph_extraction")
+workflow.add_edge("behavioral_model", "graph_extraction")
 
-# Fan-in: Models and Graph feed into the Risk Agent
-workflow.add_edge(
-    [
-        "xgb_model",
-        "anomaly_model",
-        "behavioral_model"
-    ],
-    "graph_extraction"
-)
-
-
-# Sequential finish
+# Sequential finish & evaluation
 workflow.add_edge("graph_extraction", "risk_agent")
 workflow.add_edge("risk_agent", "llm_api")
 workflow.add_edge("llm_api", "report")
-workflow.add_edge("report", END)
+workflow.add_edge("report", "evaluation")  
+workflow.add_edge("evaluation", END)
 
 app = workflow.compile()
 

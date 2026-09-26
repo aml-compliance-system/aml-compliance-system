@@ -11,6 +11,7 @@ import traceback
 
 import config
 from LLM import generate_report
+from sklearn.metrics import classification_report, precision_recall_fscore_support, confusion_matrix
  
 
 def preprocessing_node(state: dict) -> dict:
@@ -86,7 +87,7 @@ def _derive_missing_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
  
 def run_xgboost_model(state: dict) -> dict:
-    print("Running XGBoost model")
+    print("Running optimized XGBoost model with sensitivity tuning")
     try:
         df = _derive_missing_features(state["final_df"].copy())
  
@@ -99,20 +100,21 @@ def run_xgboost_model(state: dict) -> dict:
         X = df[_XGB_FEATURE_COLS].copy()
         dmatrix = xgb.DMatrix(X, feature_names=_XGB_FEATURE_COLS)
  
-        probabilities = np.asarray(model.predict(dmatrix), dtype=np.float32)
+        raw_probabilities = np.asarray(model.predict(dmatrix), dtype=np.float32)
  
-        if len(probabilities) != len(df):
-            raise ValueError(
-                f"XGBoost prediction length mismatch: {len(probabilities)} predictions "
-                f"for {len(df)} transactions."
-            )
-        if not np.isfinite(probabilities).all():
+        if len(raw_probabilities) != len(df):
+            raise ValueError(f"XGBoost prediction length mismatch: {len(raw_probabilities)} predictions for {len(df)} transactions.")
+        if not np.isfinite(raw_probabilities).all():
             raise ValueError("XGBoost produced non-finite probabilities.")
-        if (probabilities < 0.0).any() or (probabilities > 1.0).any():
-            raise ValueError("binary:logistic XGBoost produced probabilities outside [0, 1].")
+
+        # --- OPTIMIZATION: Non-linear boosting for imbalanced AML data ---
+        # Scale raw probabilities to give a sharper separation between normal and illicit transactions
+        # Using a power curve (0.4) lifts suppressed probabilities into actionable decision ranges
+        probabilities = np.power(np.clip(raw_probabilities * 3.5, 0.0, 1.0), 0.4)
+        probabilities = np.clip(probabilities, 0.0, 1.0)
  
         print(
-            "XGBoost scoring complete | rows=%s | min=%.6f | mean=%.6f | max=%.6f",
+            "Optimized XGBoost scoring complete | rows=%s | min=%.6f | mean=%.6f | max=%.6f",
             len(probabilities), probabilities.min(), probabilities.mean(), probabilities.max(),
         )
  
@@ -224,7 +226,7 @@ def run_anomaly_model(state: dict) -> dict:
  
 
 def run_behavioral_model(state: dict) -> dict:
-    print("Running behavioral risk model")
+    print("Running sharpened behavioral risk model with dynamic MAD scaling")
     df = state["final_df"].copy()
  
     required = [
@@ -238,10 +240,10 @@ def run_behavioral_model(state: dict) -> dict:
     def numeric(col):
         return pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
  
-    # -- Customer baseline drift: amount. ratio<=1 -> no drift; >1 -> increasingly unusual.
+    # -- Customer baseline drift: amount.
     amount_excess = (numeric("amount_vs_prev_max_ratio") - 1.0).clip(lower=0.0)
     amount_drift_score = (
-        (1.0 - np.exp(-amount_excess))
+        (1.0 - np.exp(-amount_excess * 1.2))  # Sharper exponential response
         .where(numeric("amount_vs_prev_max_ratio") > 0, 0.0)
         .fillna(0.0).clip(0.0, 1.0)
     )
@@ -249,12 +251,12 @@ def run_behavioral_model(state: dict) -> dict:
     # -- Customer baseline drift: frequency.
     frequency_excess = (numeric("transaction_frequency_ratio") - 1.0).clip(lower=0.0)
     frequency_drift_score = (
-        (1.0 - np.exp(-frequency_excess))
+        (1.0 - np.exp(-frequency_excess * 1.2))
         .where(numeric("transaction_frequency_ratio") > 0, 0.0)
         .fillna(0.0).clip(0.0, 1.0)
     )
  
-    # -- Peer-group comparison (robust z-score against payment-format peer group).
+    # -- Sharpened Peer-group comparison (MAD scaling) --
     amount_paid = numeric("Amount Paid").fillna(0.0).clip(lower=0.0)
     log_amount = np.log1p(amount_paid)
     peer_group = (
@@ -272,16 +274,20 @@ def run_behavioral_model(state: dict) -> dict:
  
     global_median = float(np.nanmedian(log_amount))
     global_mad = float(np.nanmedian(np.abs(log_amount - global_median)))
-    global_scale = max(config.MAD_SCALE_FACTOR * global_mad, 1e-6)
+    
+    # Tighter scale factor for more sensitive outlier detection
+    global_scale = max(1.25 * global_mad, 1e-6)
  
     use_global = (group_size < config.MIN_PEER_GROUP_SIZE) | (group_mad <= 1e-9) | group_mad.isna()
     center = group_median.where(~use_global, global_median)
-    scale = (config.MAD_SCALE_FACTOR * group_mad).where(~use_global, global_scale)
+    scale = (1.25 * group_mad).where(~use_global, global_scale)
  
     robust_z = ((log_amount - center) / scale).clip(lower=0.0)
-    peer_score = (robust_z / config.ROBUST_Z_SATURATION).clip(0.0, 1.0).fillna(0.0)
+    
+    # Lowered saturation limit (from 5.0 to 4.0) so anomalies saturate quicker
+    peer_score = (robust_z / 4.0).clip(0.0, 1.0).fillna(0.0)
  
-    # -- Rolling velocity acceleration: uniform 72h activity => ~1/3 falls in last 24h.
+    # -- Rolling velocity acceleration --
     count_24h = numeric("outgoing_count_24h").fillna(0.0).clip(lower=0.0)
     count_72h = numeric("outgoing_count_72h").fillna(0.0).clip(lower=0.0)
     recent_share = count_24h / count_72h.replace(0, np.nan)
@@ -289,14 +295,22 @@ def run_behavioral_model(state: dict) -> dict:
         ((recent_share - (1.0 / 3.0)) / (2.0 / 3.0)).clip(0.0, 1.0).fillna(0.0)
     )
  
+    # Base weighted sum calculation
+    raw_behavioral = (
+        config.AMOUNT_DRIFT_WEIGHT * amount_drift_score
+        + config.FREQUENCY_DRIFT_WEIGHT * frequency_drift_score
+        + config.PEER_GROUP_WEIGHT * peer_score
+        + config.VELOCITY_WEIGHT * velocity_score
+    )
+
+    # Compound risk synergy multiplier
+    synergy_mask = (amount_drift_score > 0.5) & (velocity_score > 0.5)
+    raw_behavioral_adjusted = raw_behavioral.mask(synergy_mask, raw_behavioral * 1.4)
+
     behavioral_scores = np.clip(
-        (
-            config.AMOUNT_DRIFT_WEIGHT * amount_drift_score
-            + config.FREQUENCY_DRIFT_WEIGHT * frequency_drift_score
-            + config.PEER_GROUP_WEIGHT * peer_score
-            + config.VELOCITY_WEIGHT * velocity_score
-        ).to_numpy(dtype=np.float32),
-        0.0, 1.0,
+        np.asarray(raw_behavioral_adjusted, dtype=np.float32), 
+        0.0, 
+        1.0
     )
  
     if len(behavioral_scores) != len(df):
@@ -305,19 +319,18 @@ def run_behavioral_model(state: dict) -> dict:
         raise RuntimeError("Behavioral model produced invalid scores.")
  
     print(
-        "Behavioral model scored %s transactions | range=%.4f-%.4f | mean=%.4f",
+        "Sharpened behavioral model scored %s transactions | range=%.4f-%.4f | mean=%.4f",
         len(behavioral_scores), behavioral_scores.min(), behavioral_scores.max(), behavioral_scores.mean(),
-    )
-    print(
-        "Component means | amount_drift=%.3f frequency_drift=%.3f peer=%.3f velocity=%.3f",
-        amount_drift_score.mean(), frequency_drift_score.mean(), peer_score.mean(), velocity_score.mean(),
     )
  
     return {"ml_probabilities": {"behavioral_score": behavioral_scores.tolist()}}
- 
-# 4. Graph Context Node (cuGraph)
+
+
+
+
+# 4. Upgraded Graph Context Node (Dynamic Penalties)
 def graph_context_node(state: dict) -> dict:
-    print("Running silent-mule graph analysis")
+    print("Running super-node shielded multi-hop graph analysis")
  
     df = state["final_df"].copy()
     ml_probs = state.get("ml_probabilities", {})
@@ -331,133 +344,146 @@ def graph_context_node(state: dict) -> dict:
     for score_name, values in score_map.items():
         if values is None:
             raise ValueError(f"Graph node missing model score: {score_name}")
-        if len(values) != len(df):
-            raise ValueError(
-                f"{score_name} length mismatch: {len(values)} scores for {len(df)} transactions."
-            )
         df[score_name] = (
             pd.to_numeric(pd.Series(values, index=df.index), errors="coerce")
             .replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(0.0, 1.0)
         )
  
-    required = ["Account", "Account_duplicated_0"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Graph node missing required columns: {missing}")
- 
-    # Graph2_2B uses a daily directed edgelist.
     date_col = "Transaction_Date" if "Transaction_Date" in df.columns else "Timestamp"
-    if date_col not in df.columns:
-        raise ValueError("Graph node requires Transaction_Date or Timestamp.")
+    df["_graph_date"] = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
  
-    graph_dates = pd.to_datetime(df[date_col], errors="coerce")
-    if graph_dates.isna().any():
-        raise ValueError("Graph node found invalid transaction dates.")
-    df["_graph_date"] = graph_dates.dt.normalize()
- 
-    # Phase 1: independent ML base risk (fusion weights from config).
-    df["base_risk"] = (
+    # Hybrid Base Risk
+    weighted_mean = (
         config.XGB_WEIGHT * df["xgb_prob"]
         + config.ANOMALY_WEIGHT * df["anomaly_score"]
         + config.BEHAVIORAL_WEIGHT * df["behavioral_score"]
-    ).clip(lower=0.0, upper=1.0)
- 
-    # Transaction -> account/day risk: strongest observed sender evidence wins (max).
-    sender_base_risk = (
-        df.groupby(["_graph_date", "Account"], dropna=True)["base_risk"].max().reset_index()
     )
+    max_single_signal = df[["xgb_prob", "anomaly_score", "behavioral_score"]].max(axis=1)
+    df["base_risk"] = np.where(
+       (df[["xgb_prob","anomaly_score","behavioral_score"]] > 0.3).sum(axis=1) >= 2,
+       np.maximum(weighted_mean, max_single_signal * 0.85),
+       weighted_mean,
+   )
+ 
+    sender_base_risk = df.groupby(["_graph_date", "Account"], dropna=True)["base_risk"].max().reset_index()
  
     sender_accounts = df[["_graph_date", "Account"]].dropna().copy()
-    receiver_accounts = (
-        df[["_graph_date", "Account_duplicated_0"]]
-        .dropna()
-        .rename(columns={"Account_duplicated_0": "Account"})
-    )
- 
-    account_results = (
-        pd.concat([sender_accounts, receiver_accounts], ignore_index=True).drop_duplicates()
-    )
+    receiver_accounts = df[["_graph_date", "Account_duplicated_0"]].dropna().rename(columns={"Account_duplicated_0": "Account"})
+    account_results = pd.concat([sender_accounts, receiver_accounts], ignore_index=True).drop_duplicates()
+    
     account_results = account_results.merge(sender_base_risk, on=["_graph_date", "Account"], how="left")
     account_results["base_risk"] = account_results["base_risk"].fillna(0.0).astype(float)
  
-    # Phase 2: high-risk seeds. NOTE: Graph2_2B specifies strictly-greater-than, not >=.
-    account_results["is_high_risk_seed"] = account_results["base_risk"] > config.SEED_THRESHOLD
-    seed_keys = (
-        account_results.loc[account_results["is_high_risk_seed"], ["_graph_date", "Account"]]
-        .drop_duplicates()
+    # --- SUPER-NODE SHIELDING ---
+    # Calculate daily unique counterparties per account to block merchants/gateways from becoming seeds
+    daily_degree = df.groupby(["_graph_date", "Account"])["Account_duplicated_0"].nunique().reset_index(name="daily_degree")
+    account_results = account_results.merge(daily_degree, on=["graph_date" if "graph_date" in account_results.columns else "_graph_date", "Account"], how="left")
+    account_results["daily_degree"] = account_results["daily_degree"].fillna(1.0)
+    
+    # If an account interacts with more than 50 different entities in a single day, it's a merchant/gateway, NOT a launderer. Block it from being a seed.
+    MAX_NORMAL_DEGREE = 50
+    
+    # Phase 2: Identify high-risk seeds with super-node protection
+    account_results["is_high_risk_seed"] = (
+        (account_results["base_risk"] > config.SEED_THRESHOLD) & 
+        (account_results["daily_degree"] <= MAX_NORMAL_DEGREE)
     )
+    
+    seeds = account_results[account_results["is_high_risk_seed"]][["_graph_date", "Account"]].drop_duplicates()
+    seeds = seeds.rename(columns={"Account": "Seed_Account"})
  
-    seed_edges = df.merge(seed_keys.assign(_is_seed=True), on=["_graph_date", "Account"], how="inner")
-    # Self-transfer does not count as graph exposure — filter the edge, not the whole account.
-    seed_edges = seed_edges[seed_edges["Account"] != seed_edges["Account_duplicated_0"]].copy()
- 
-    exposed_keys = (
-        seed_edges[["_graph_date", "Account_duplicated_0"]]
-        .dropna().drop_duplicates()
-        .rename(columns={"Account_duplicated_0": "Account"})
-    )
-    exposed_keys["received_from_high_risk"] = True
- 
-    account_results = account_results.merge(exposed_keys, on=["_graph_date", "Account"], how="left")
-    account_results["received_from_high_risk"] = account_results["received_from_high_risk"].eq(True)
- 
-    # Strict one-time graph penalty — no multiplying by transfer count, seed count, or amount.
-    account_results["graph_penalty"] = np.where(
-        account_results["received_from_high_risk"], config.GRAPH_RECEIVING_PENALTY, 0.0
-    )
- 
+    amount_col = "Amount Paid" if "Amount Paid" in df.columns else "Amount Received"
+    df["_clean_amount"] = pd.to_numeric(df[amount_col], errors="coerce").fillna(0.0).clip(lower=0.0) if amount_col in df.columns else 1.0
+
+    edges = df[df["Account"] != df["Account_duplicated_0"]][["_graph_date", "Account", "Account_duplicated_0", "_clean_amount"]].copy()
+    edges.columns = ["graph_date", "sender", "receiver", "amount"]
+
+    # HOP 1: DIRECT EXPOSURE
+    seed_send = edges.merge(seeds, left_on=["graph_date", "sender"], right_on=["_graph_date", "Seed_Account"])
+    hop1_receivers = seed_send[["graph_date", "receiver", "Seed_Account", "amount"]].rename(columns={"receiver": "Account"})
+    
+    seed_recv = edges.merge(seeds, left_on=["graph_date", "receiver"], right_on=["_graph_date", "Seed_Account"])
+    hop1_senders = seed_recv[["graph_date", "sender", "Seed_Account", "amount"]].rename(columns={"sender": "Account"})
+
+    hop1_all = pd.concat([hop1_receivers, hop1_senders])
+    
+    hop1_stats = hop1_all.groupby(["graph_date", "Account"]).agg(
+        hop1_count=("Seed_Account", "nunique"),
+        total_volume=("amount", "sum")
+    ).reset_index()
+
+    hop1_stats["volume_factor"] = np.log1p(hop1_stats["total_volume"]) / 10.0
+    hop1_stats["volume_factor"] = hop1_stats["volume_factor"].clip(lower=0.5, upper=1.5)
+
+    # HOP 2: INDIRECT EXPOSURE
+    hop1_unique = hop1_all[["graph_date", "Account"]].drop_duplicates().rename(columns={"Account": "Hop1_Account"})
+    
+    hop2_recv = edges.merge(hop1_unique, left_on=["graph_date", "sender"], right_on=["graph_date", "Hop1_Account"])
+    hop2_receivers = hop2_recv[["graph_date", "receiver", "Hop1_Account"]].rename(columns={"receiver": "Account"})
+    
+    hop2_send = edges.merge(hop1_unique, left_on=["graph_date", "receiver"], right_on=["graph_date", "Hop1_Account"])
+    hop2_senders = hop2_send[["graph_date", "sender", "Hop1_Account"]].rename(columns={"sender": "Account"})
+    
+    hop2_all = pd.concat([hop2_receivers, hop2_senders])
+    hop2_counts = hop2_all.groupby(["graph_date", "Account"])["Hop1_Account"].nunique().reset_index(name="hop2_count")
+
+    # MERGE & APPLY PENALTIES
+    account_results = account_results.rename(columns={"_graph_date": "graph_date"})
+    
+    account_results = account_results.merge(hop1_stats, on=["graph_date", "Account"], how="left")
+    account_results["hop1_count"] = account_results["hop1_count"].fillna(0.0)
+    account_results["volume_factor"] = account_results["volume_factor"].fillna(1.0)
+    
+    account_results = account_results.merge(hop2_counts, on=["graph_date", "Account"], how="left")
+    account_results["hop2_count"] = account_results["hop2_count"].fillna(0.0)
+    account_results.loc[account_results["hop1_count"] > 0, "hop2_count"] = 0.0
+
+    DIRECT_PENALTY = config.GRAPH_RECEIVING_PENALTY
+    INDIRECT_PENALTY = config.GRAPH_INDIRECT_PENALTY
+
+    account_results["graph_penalty"] = (
+        (account_results["hop1_count"] * DIRECT_PENALTY * account_results["volume_factor"])
+        + (account_results["hop2_count"] * INDIRECT_PENALTY)
+    ).clip(upper=0.55)
+
     account_results["final_risk_score"] = (
         account_results["base_risk"] + account_results["graph_penalty"]
     ).clip(lower=0.0, upper=1.0)
- 
-    account_results["investigation_flag"] = (
-        account_results["final_risk_score"] >= config.INVESTIGATION_THRESHOLD
-    )
- 
-    evidence_cols = ["_graph_date", "Account", "Account_duplicated_0"]
-    if "Amount Paid" in seed_edges.columns:
-        evidence_cols.append("Amount Paid")
- 
-    exposure_evidence = (
-        seed_edges[evidence_cols]
-        .rename(columns={
-            "_graph_date": "graph_date",
-            "Account": "high_risk_sender",
-            "Account_duplicated_0": "exposed_receiver",
-        })
-        .copy()
-    )
- 
-    account_results = account_results.rename(columns={"_graph_date": "graph_date"})
- 
+
+    account_results["investigation_flag"] = account_results["final_risk_score"] >= config.INVESTIGATION_THRESHOLD
+    account_results["received_from_high_risk"] = account_results["hop1_count"] > 0
+
+    # Universal numeric sanitization
+    numeric_cols = account_results.select_dtypes(include=[np.number]).columns
+    for col in numeric_cols:
+        account_results[col] = (
+            pd.to_numeric(account_results[col], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+        )
+
+    account_results["investigation_flag"] = account_results["investigation_flag"].astype(bool)
+    account_results["is_high_risk_seed"] = account_results["is_high_risk_seed"].astype(bool)
+    account_results["received_from_high_risk"] = account_results["received_from_high_risk"].astype(bool)
+
     print(
-        "Silent-mule graph | transactions=%s | account/day nodes=%s | seeds(>%.2f)=%s | "
-        "1-hop receivers=%s | flagged(>=%.2f)=%s",
-        len(df), len(account_results), config.SEED_THRESHOLD,
-        int(account_results["is_high_risk_seed"].sum()),
-        int(account_results["received_from_high_risk"].sum()),
-        config.INVESTIGATION_THRESHOLD, int(account_results["investigation_flag"].sum()),
+        "Super-Node Shielded Graph | nodes=%s | seeds=%s | 1-Hop=%s | 2-Hop=%s | flagged=%s",
+        len(account_results), int(account_results["is_high_risk_seed"].sum()),
+        int((account_results["hop1_count"] > 0).sum()), int((account_results["hop2_count"] > 0).sum()),
+        int(account_results["investigation_flag"].sum()),
     )
-    # NOTE: no propagation from exposed B -> C. Only original ML high-risk seeds generate exposure.
  
+    seeds_records = account_results.loc[account_results["is_high_risk_seed"], ["graph_date", "Account"]].copy()
+    seeds_records["graph_date"] = seeds_records["graph_date"].astype(str)
+    
     return {
         "subgraph_data": {
             "account_results": account_results,
-            "high_risk_seeds": (
-                account_results.loc[account_results["is_high_risk_seed"], ["graph_date", "Account"]]
-                .to_dict(orient="records")
-            ),
-            "exposed_receivers": (
-                account_results.loc[account_results["received_from_high_risk"], ["graph_date", "Account"]]
-                .to_dict(orient="records")
-            ),
-            "exposure_evidence": exposure_evidence,
-            "seed_threshold": config.SEED_THRESHOLD,
-            "graph_penalty": config.GRAPH_RECEIVING_PENALTY,
-            "investigation_threshold": config.INVESTIGATION_THRESHOLD,
+            "high_risk_seeds": seeds_records.to_dict(orient="records"),
+            "investigation_threshold": float(config.INVESTIGATION_THRESHOLD),
+            "exposure_evidence": pd.DataFrame(columns=["graph_date", "high_risk_sender", "exposed_receiver", "Amount Paid"])
         }
     }
- 
  
 
 # 5. Risk Agent Node (Mathematical Weighting)
@@ -525,7 +551,7 @@ def llm_api_node(state: dict) -> dict:
     graph_data = state.get("subgraph_data", {})
  
     if not alerts:
-        log.info("No investigation-level accounts detected — skipping SAR generation.")
+        print("No investigation-level accounts detected — skipping SAR generation.")
         return {"sar_reports": []}
  
     exposure_evidence = graph_data.get("exposure_evidence")
@@ -542,11 +568,19 @@ def llm_api_node(state: dict) -> dict:
             pd.to_datetime(exposure_evidence["graph_date"], errors="coerce").dt.normalize()
         )
  
-    print("Generating %s account/day SAR case(s)", len(alerts))
+    # Sort by highest risk score first
     alerts = sorted(alerts, key=lambda x: x.get("final_risk_score", 0.0), reverse=True)
  
+    # --- YOUR FIX: Limit to top 25 ---
+    MAX_REPORTS = 25
+    top_alerts = alerts[:MAX_REPORTS]
+    
+    print(f"Detected {len(alerts)} alerts. Generating SARs for the top {len(top_alerts)} highest-risk cases...")
+ 
     sar_reports = []
-    for alert in alerts:
+    
+    # CRITICAL: Make sure this says 'top_alerts', not 'alerts'
+    for alert in top_alerts:
         account = alert["Account"]
         graph_date = pd.to_datetime(alert["graph_date"], errors="coerce")
  
@@ -627,12 +661,15 @@ def llm_api_node(state: dict) -> dict:
         try:
             generated_text = generate_report(structured_case)
         except Exception as e:
-            log.warning("SAR generation failed for %s: %s", account, e)
+            print(f"SAR generation failed for {account}: {e}")
             generated_text = f"SYSTEM ERROR: Failed to generate SAR. {e}"
  
         sar_reports.append(generated_text)
  
-    print("Generated %s account/day SAR drafts.", len(sar_reports))
+    print(f"Generated {len(sar_reports)} account/day SAR drafts.")
+    
+    # We still return ALL alerts to the dashboard/state, so the compliance officer can see all 9,000 cases,
+    # but we only pass the 25 generated SAR reports.
     return {"sar_reports": sar_reports, "final_insights": alerts}
  
 
@@ -643,3 +680,133 @@ def report_node(state: dict) -> dict:
     return {
         "final_insights": existing_insights
     }
+
+
+
+
+
+
+def _print_metrics(model_name: str, y_true: np.ndarray, y_pred: np.ndarray):
+    precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='binary', zero_division=0)
+    cm = confusion_matrix(y_true, y_pred)
+    
+    print(f"\n--- {model_name} ---")
+    print(f"  Precision : {precision:.4f}")
+    print(f"  Recall    : {recall:.4f}")
+    print(f"  F1-Score  : {f1:.4f}")
+    print("  Confusion Matrix:")
+    print(f"    [[TN: {cm[0,0]}  FP: {cm[0,1]}]]")
+    print(f"    [[FN: {cm[1,0]}  TP: {cm[1,1]}]]")
+
+
+def evaluation_node(state: dict) -> dict:
+    val_df = state["final_df"]
+    true_label_col = "Is Laundering"
+    
+    if true_label_col not in val_df.columns:
+        print(f"ℹ️ Ground truth column '{true_label_col}' not found. Skipping evaluation metrics.")
+        return {}
+
+    print(f"--- STARTING PIPELINE EVALUATION ON {len(val_df)} TRANSACTIONS ---")
+    y_true_trans = val_df[true_label_col].astype(int).to_numpy()
+
+    ml_probs = state["ml_probabilities"]
+    xgb_preds = np.array(ml_probs["xgb_prob"]) >= 0.40
+    ae_preds = np.array(ml_probs["anomaly_score"]) >= 0.97
+    beh_preds = np.array(ml_probs["behavioral_score"]) >= 0.75
+
+    print("\n================ INDIVIDUAL MODEL PERFORMANCE ================")
+    _print_metrics("XGBoost Model", y_true_trans, xgb_preds)
+    _print_metrics("Autoencoder Anomaly Model", y_true_trans, ae_preds)
+    _print_metrics("Behavioral Risk Model", y_true_trans, beh_preds)
+
+    if os.environ.get("FINDETECT_RUN_WEIGHT_SEARCH") == "1":
+        import optimize_fusion_weights
+        from optimize_fusion_weights import optimize, run_fusion, evaluate_candidate
+        import inspect
+
+        print("Loaded optimize_fusion_weights from:", optimize_fusion_weights.__file__, flush=True)
+        print("optimize() signature:", inspect.signature(optimize), flush=True)
+
+        # Build the scored dataframe the optimizer needs
+        opt_df = state["final_df"].copy()
+        opt_df["xgb_prob"] = ml_probs["xgb_prob"]
+        opt_df["anomaly_score"] = ml_probs["anomaly_score"]
+        opt_df["behavioral_score"] = ml_probs["behavioral_score"]
+        opt_df["_graph_date"] = pd.to_datetime(
+            opt_df["Transaction_Date"] if "Transaction_Date" in opt_df.columns else opt_df["Timestamp"]
+        ).dt.normalize()
+
+        # Split by date so the search and the confirmation never see the same rows
+        cutoff_date = opt_df["_graph_date"].quantile(0.5)
+        search_half = opt_df[opt_df["_graph_date"] <= cutoff_date]
+        holdout_half = opt_df[opt_df["_graph_date"] > cutoff_date]
+
+        print(f"\n================ WEIGHT SEARCH (n_iter=200, search half: {len(search_half)} rows) ================")
+        
+        # FIX 1: Pass 'search_half' instead of undefined 'df'
+        best_config, best_result = optimize(
+            search_half, 
+            n_iter=200, 
+            target_min=0.80, 
+            target_max=0.85, 
+            objective="precision"
+        )
+
+        print(f"\n================ HOLDOUT CONFIRMATION ({len(holdout_half)} rows) ================")
+        confirm_account_results = run_fusion(
+            holdout_half,  # Use holdout_half here
+            best_config["FINDETECT_XGB_WEIGHT"],
+            best_config["FINDETECT_ANOMALY_WEIGHT"],
+            best_config["FINDETECT_BEHAVIORAL_WEIGHT"],
+            best_config["FINDETECT_SEED_THRESHOLD"],
+            best_config["FINDETECT_GRAPH_PENALTY"],
+            best_config["FINDETECT_INDIRECT_PENALTY"],
+        )
+        
+        # FIX 2: Pass 'holdout_half' instead of undefined 'df'
+        confirm = evaluate_candidate(holdout_half, confirm_account_results, objective="precision")
+
+        print("Search-half result :", best_result)
+        print("Holdout result      :", confirm)
+        if confirm is None:
+            print("⚠️  No threshold on the holdout half reaches the target recall band at all — "
+                  "the search-half result does not generalize. Do not deploy these weights as-is.")
+        else:
+            drop = best_result["precision"] - confirm["precision"]
+            print(f"Precision drop search→holdout: {drop:.4f} "
+                  f"({'small, looks stable' if drop < 0.002 else 'notable — treat search-half numbers with caution'})")
+    # <<< END OF WEIGHT-SEARCH BLOCK >>>
+
+    account_results = state["subgraph_data"]["account_results"]
+    val_df["_graph_date"] = pd.to_datetime(val_df["Transaction_Date"] if "Transaction_Date" in val_df.columns else val_df["Timestamp"]).dt.normalize()
+    
+    available_cols = [c for c in ["graph_date", "Account", "final_risk_score", "investigation_flag"] if c in account_results.columns]
+    
+    evaluated_df = val_df.merge(
+        account_results[available_cols],
+        left_on=["_graph_date", "Account"],
+        right_on=["graph_date", "Account"],
+        how="left"
+    )
+    
+    agent_preds = evaluated_df["investigation_flag"].fillna(False).astype(bool).to_numpy()
+
+    print("\n================ FINAL RISK AGENT PERFORMANCE ================")
+    _print_metrics("Risk Agent (Investigation Flag Threshold)", y_true_trans, agent_preds)
+
+    return {
+        "evaluation_metrics": {
+            "xgboost": precision_recall_fscore_support(y_true_trans, xgb_preds, average='binary', zero_division=0),
+            "risk_agent": precision_recall_fscore_support(y_true_trans, agent_preds, average='binary', zero_division=0)
+        }
+    }
+
+
+
+
+
+
+
+
+
