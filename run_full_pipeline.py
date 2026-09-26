@@ -3,13 +3,11 @@ import os
 import gc
 import json
 import argparse
-from pathlib import Path
-
 import duckdb
 import pandas as pd
 
 from LangGraph import app
-
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
 

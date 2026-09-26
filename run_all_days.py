@@ -2,8 +2,9 @@ import json
 import os
 import subprocess
 import sys
-from pathlib import Path
 import duckdb
+
+from pathlib import Path
 
 # Automatically finds the folder where this script is saved
 REPO_ROOT = Path(__file__).resolve().parent

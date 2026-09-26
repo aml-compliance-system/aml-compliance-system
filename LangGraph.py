@@ -1,9 +1,15 @@
 from langgraph.graph import StateGraph, END
 from AMLPipelineState import AMLPipelineState
-from  nodes import (preprocessing_node,run_xgboost_model,run_anomaly_model,
-                    graph_context_node,risk_agent_node,
-                    llm_api_node,report_node,run_behavioral_model)
-
+from nodes import (
+    preprocessing_node,
+    run_xgboost_model,
+    run_anomaly_model,
+    run_behavioral_model,
+    graph_context_node,
+    risk_agent_node,
+    llm_api_node,
+    report_node,
+)
 workflow = StateGraph(AMLPipelineState)
 
 # 1. Add Nodes
@@ -92,12 +98,12 @@ if __name__ == "__main__":
         if not high_risk_sample.empty:
 
             print(
-                f"\\n🚨 Found "
+                f"\n🚨 Found "
                 f"{len(high_risk_sample):,} "
                 "High Risk account/day cases."
             )
 
-            print("\\n--- TOP HIGH-RISK CASES ---")
+            print("\n--- TOP HIGH-RISK CASES ---")
 
             print(
                 high_risk_sample
@@ -108,7 +114,7 @@ if __name__ == "__main__":
         else:
 
             print(
-                "\\n✅ No accounts crossed the "
+                "\n✅ No accounts crossed the "
                 "investigation threshold."
             )
 
@@ -132,19 +138,19 @@ if __name__ == "__main__":
     if reports:
 
         print(
-            f"\\n📝 Generated "
+            f"\n📝 Generated "
             f"{len(reports):,} "
             "SAR draft(s)."
         )
 
         print(
-            "\\n--- SAMPLE SAR REPORT ---"
+            "\n--- SAMPLE SAR REPORT ---"
         )
 
         print(reports[0])
 
         print(
-            "-------------------------\\n"
+            "-------------------------\n"
         )
 
     else:

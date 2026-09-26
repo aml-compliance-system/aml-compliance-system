@@ -6,13 +6,21 @@ numpy==2.1.3
 pandas==2.2.3
 duckdb==1.3.2
 pyarrow==23.0.1
-
+ 
 xgboost==3.4.1
-
+ 
 tensorflow==2.20.0
 keras==3.13.2
-
+ 
 scikit-learn==1.6.1
 joblib==1.6.0
-
+ 
 langgraph==1.2.11
+ 
+# API server (main.py)
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+ 
+# Local LLM chat (main.py /chat endpoint)
+ollama==0.4.5

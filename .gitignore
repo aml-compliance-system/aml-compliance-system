@@ -27,3 +27,4 @@ Data/
 __pycache__/
 *.parquet
 *.pyc
+.vscode/
