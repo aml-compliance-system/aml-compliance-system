@@ -1,6 +1,6 @@
 """
 One-time training script for the stacking meta-learner.
-Run this after your base models + graph have scored the labeled dataset.
+Run this AFTER your base models + graph have scored the labeled dataset.
 
 Usage:
     python train_meta_learner.py
@@ -14,7 +14,6 @@ from nodes import (
     run_anomaly_model,
     run_behavioral_model,
     graph_context_node,
-    _derive_missing_features,
 )
 from customer_deviation import add_customer_deviation_features
 

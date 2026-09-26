@@ -80,7 +80,7 @@ MAD_SCALE_FACTOR = 1.4826  # constant: converts MAD to a normal-equivalent std d
 SEED_THRESHOLD = float(os.environ.get("FINDETECT_SEED_THRESHOLD", 0.45))
 GRAPH_RECEIVING_PENALTY = float(os.environ.get("FINDETECT_GRAPH_PENALTY", 0.3046))
 GRAPH_INDIRECT_PENALTY = float(os.environ.get("FINDETECT_INDIRECT_PENALTY", 0.0555))  # NEW
-INVESTIGATION_THRESHOLD = float(os.environ.get("FINDETECT_INVESTIGATION_THRESHOLD", 0.33))
+INVESTIGATION_THRESHOLD = float(os.environ.get("FINDETECT_INVESTIGATION_THRESHOLD", 0.24))
 MEDIUM_RISK_THRESHOLD = float(os.environ.get("FINDETECT_MEDIUM_RISK_THRESHOLD", 0.30))
 # ---------------------------------------------------------------
 # LLM chat settings (used by main.py's /chat endpoint)

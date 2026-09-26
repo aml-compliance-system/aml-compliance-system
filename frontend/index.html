@@ -55,8 +55,8 @@
                 console.log("FastAPI Response Payload:", data);
                 
                 // --- FIXED KEYS BASED ON YOUR CONSOLE LOG ---
-                const insights = data.case_data || [];
-                const reports = data.reports || [];
+                const insights = data.final_insights || data.case_data || [];
+                const reports = data.sar_reports || data.reports || [];
                 
                 if (insights.length === 0) {
                     grid.innerHTML = `<p class="text-emerald-600 font-medium col-span-full">✅ Pipeline finished safely. No high-risk transactions detected.</p>`;

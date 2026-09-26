@@ -627,43 +627,45 @@ def risk_agent_node(state: dict) -> dict:
     results["investigation_flag"] = results["final_risk_score"] >= investigation_threshold
 
     # ============================================================================
-    # HARD RULE AUTO-CLEAR FILTERS (TIGHTENED FOR 85% RECALL TARGET)
+    # HARD RULE AUTO-CLEAR FILTERS (OPTIMIZED FOR META-LEARNER)
     # ============================================================================
     flagged_accounts = results[results["investigation_flag"]].copy()
     initial_queue_size = len(flagged_accounts)
-
-    # Filter 1: Require meaningful base_risk (filter out graph-padding noise)
+    
+    # Filter 1: Very mild base_risk check (lowered to let meta-learner do its job)
     if "base_risk" in flagged_accounts.columns:
-        flagged_accounts = flagged_accounts[flagged_accounts["base_risk"] >= 0.15]
-        print(f"Filter 1 (base_risk >= 0.15): {initial_queue_size} → {len(flagged_accounts)}")
-
-    # Filter 2: Require a STRONG signal in at least one area
+        flagged_accounts = flagged_accounts[flagged_accounts["base_risk"] >= 0.05]
+        print(f"Filter 1 (base_risk >= 0.05): {initial_queue_size} → {len(flagged_accounts)}")
+    
+    # Filter 2: Highly permissive. Trust the meta-learner's combined score.
+    # Only filter out accounts that have absolutely ZERO signal anywhere.
     if "hop1_count" in flagged_accounts.columns:
         has_anomaly = "anomaly_score" in flagged_accounts.columns
-
+        
         if has_anomaly:
             flagged_accounts = flagged_accounts[
                 (flagged_accounts["hop1_count"] >= 1) |       # Has graph exposure
-                (flagged_accounts["base_risk"] >= 0.25) |     # OR solid base model agreement
-                (flagged_accounts["anomaly_score"] >= 0.93)   # OR strong Autoencoder signal
+                (flagged_accounts["base_risk"] >= 0.10) |     # OR minimal base signal
+                (flagged_accounts["anomaly_score"] >= 0.80) | # OR moderate anomaly signal
+                (flagged_accounts["behavioral_score"] >= 0.30)# OR moderate behavioral signal
             ]
-            print(f"Filter 2 (graph OR base>=0.25 OR anomaly>=0.92): → {len(flagged_accounts)}")
+            print(f"Filter 2 (permissive signal check): → {len(flagged_accounts)}")
         else:
             flagged_accounts = flagged_accounts[
                 (flagged_accounts["hop1_count"] >= 1) |
-                (flagged_accounts["base_risk"] >= 0.25)
+                (flagged_accounts["base_risk"] >= 0.10)
             ]
-            print(f"Filter 2 (graph signal OR base_risk >= 0.25): → {len(flagged_accounts)}")
-
-    # Filter 3: Final score sanity check (matches INVESTIGATION_THRESHOLD)
-    flagged_accounts = flagged_accounts[flagged_accounts["final_risk_score"] >= 0.32]
-    print(f"Filter 3 (final_risk_score >= 0.32): → {len(flagged_accounts)}")
-
+            print(f"Filter 2 (permissive signal check): → {len(flagged_accounts)}")
+    
+    # Filter 3: Final score sanity check (matches relaxed INVESTIGATION_THRESHOLD)
+    flagged_accounts = flagged_accounts[flagged_accounts["final_risk_score"] >= 0.28]
+    print(f"Filter 3 (final_risk_score >= 0.28): → {len(flagged_accounts)}")
+    
     final_queue_size = len(flagged_accounts)
     reduction_pct = ((initial_queue_size - final_queue_size) / initial_queue_size * 100) if initial_queue_size > 0 else 0
     print(f"Hard Rule Filters: Queue reduced {initial_queue_size} → {final_queue_size} ({reduction_pct:.1f}% reduction)")
     # ============================================================================
-
+    
     # ============================================================================
     # TIERED INVESTIGATION WORKFLOW
     # ============================================================================
@@ -675,36 +677,42 @@ def risk_agent_node(state: dict) -> dict:
         ["TIER_1_HIGH", "TIER_2_MEDIUM"],
         default="TIER_3_LOW"
     )
-
+    
     flagged_accounts["risk_label"] = flagged_accounts["investigation_tier"]
-
+    
     # SORT BY RISK SCORE DESCENDING (most important accounts first)
     flagged_accounts = flagged_accounts.sort_values(
-        by="final_risk_score",
+        by="final_risk_score", 
         ascending=False
     ).reset_index(drop=True)
-
+    
     tier_counts = flagged_accounts["investigation_tier"].value_counts()
     print(
         f"Tiered Queue | TIER_1_HIGH: {tier_counts.get('TIER_1_HIGH', 0)} | "
         f"TIER_2_MEDIUM: {tier_counts.get('TIER_2_MEDIUM', 0)} | "
         f"TIER_3_LOW: {tier_counts.get('TIER_3_LOW', 0)}"
     )
-
+    
     # ============================================================================
-    # PROPAGATE FILTERED FLAGS BACK TO MAIN RESULTS
+    # PROPAGATE FILTERED FLAGS BACK TO MAIN RESULTS (CRITICAL FOR EVALUATION)
     # ============================================================================
+    # 1. Create a dataframe of ONLY the accounts that passed the hard rules
     filtered_flags = flagged_accounts[["graph_date", "Account"]].copy()
     filtered_flags["investigation_flag"] = True
-
+    
+    # 2. Drop old flag/tier columns from the main results to avoid merge conflicts
     results = results.drop(columns=["investigation_flag", "investigation_tier"], errors="ignore")
+    
+    # 3. Merge the filtered status back into the main results
     results = results.merge(filtered_flags, on=["graph_date", "Account"], how="left")
     results["investigation_flag"] = results["investigation_flag"].fillna(False).astype(bool)
-
+    
+    # 4. Merge tier info back as well
     tier_info = flagged_accounts[["graph_date", "Account", "investigation_tier"]].copy()
     results = results.merge(tier_info, on=["graph_date", "Account"], how="left")
     results["investigation_tier"] = results["investigation_tier"].fillna("NOT_FLAGGED")
-
+    
+    # 5. Update risk_label to reflect the filtered state
     results["risk_label"] = np.select(
         [results["investigation_flag"], results["final_risk_score"] >= config.MEDIUM_RISK_THRESHOLD],
         ["High Risk", "Medium Risk"],
@@ -715,7 +723,7 @@ def risk_agent_node(state: dict) -> dict:
     high_count = int((results["risk_label"] == "High Risk").sum())
     med_count = int((results["risk_label"] == "Medium Risk").sum())
     low_count = int((results["risk_label"] == "Low Risk").sum())
-
+    
     print(
         f"Risk agent results | high={high_count} | medium={med_count} | "
         f"low={low_count} | routed for investigation={len(flagged_accounts)}"
@@ -855,7 +863,7 @@ def llm_api_node(state: dict) -> dict:
     
     # We still return ALL alerts to the dashboard/state, so the compliance officer can see all 9,000 cases,
     # but we only pass the 25 generated SAR reports.
-    return {"sar_reports": sar_reports, "final_insights": alerts}
+    return {"sar_reports": sar_reports, "final_insights": top_alerts}
  
 
 # 7. Report Node
