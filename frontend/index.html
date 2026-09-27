@@ -48,7 +48,7 @@
                 const response = await fetch('http://127.0.0.1:8000/pipeline/analyze', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ final_parquet_path: "Data/processed/sample_1000k.parquet" })
+                    body: JSON.stringify({ final_parquet_path: "Data/processed/prod_sample_oct23_25.parquet" })
                 });
                 
                 const data = await response.json();

@@ -52,15 +52,15 @@ AUTOENCODER_MODEL_FILE = "autoencoder_final64_fixed.keras"
 AUTOENCODER_BUNDLE_FILE = "preprocessing_and_scoring_final64.joblib"
  
 DEFAULT_PARQUET_PATH = Path(
-    os.environ.get("FINDETECT_DEFAULT_PARQUET", REPO_ROOT / "Data" / "processed" / "sample_1000k.parquet")
+    os.environ.get("FINDETECT_DEFAULT_PARQUET", REPO_ROOT / "Data" / "processed" / "prod_sample_oct23_25.parquet")
 ).expanduser()
  
 # ---------------------------------------------------------------
 # Risk fusion weights (must sum to 1.0)
 # ---------------------------------------------------------------
-XGB_WEIGHT = float(os.environ.get("FINDETECT_XGB_WEIGHT", 0.30 ))
-ANOMALY_WEIGHT = float(os.environ.get("FINDETECT_ANOMALY_WEIGHT", 0.40))
-BEHAVIORAL_WEIGHT = float(os.environ.get("FINDETECT_BEHAVIORAL_WEIGHT", 0.30 ))
+XGB_WEIGHT = float(os.environ.get("FINDETECT_XGB_WEIGHT", 0.15 ))
+ANOMALY_WEIGHT = float(os.environ.get("FINDETECT_ANOMALY_WEIGHT", 0.65))
+BEHAVIORAL_WEIGHT = float(os.environ.get("FINDETECT_BEHAVIORAL_WEIGHT", 0.20 ))
  
 # ---------------------------------------------------------------
 # Behavioral model sub-weights (must sum to 1.0)
@@ -80,7 +80,7 @@ MAD_SCALE_FACTOR = 1.4826  # constant: converts MAD to a normal-equivalent std d
 SEED_THRESHOLD = float(os.environ.get("FINDETECT_SEED_THRESHOLD", 0.45))
 GRAPH_RECEIVING_PENALTY = float(os.environ.get("FINDETECT_GRAPH_PENALTY", 0.3046))
 GRAPH_INDIRECT_PENALTY = float(os.environ.get("FINDETECT_INDIRECT_PENALTY", 0.0555))  # NEW
-INVESTIGATION_THRESHOLD = float(os.environ.get("FINDETECT_INVESTIGATION_THRESHOLD", 0.24))
+INVESTIGATION_THRESHOLD = float(os.environ.get("FINDETECT_INVESTIGATION_THRESHOLD", 0.38))
 MEDIUM_RISK_THRESHOLD = float(os.environ.get("FINDETECT_MEDIUM_RISK_THRESHOLD", 0.30))
 # ---------------------------------------------------------------
 # LLM chat settings (used by main.py's /chat endpoint)

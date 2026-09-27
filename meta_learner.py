@@ -1,121 +1,61 @@
 """
-Stacking Meta-Learner: Non-linear combination of base model outputs + graph features.
-Replaces the simple weighted average with a trained XGBoost that learns interactions.
+meta_learner.py
+Complete, self-contained module for meta-learner training and inference.
 """
-import os
 import joblib
-import numpy as np
 import pandas as pd
+import numpy as np
 import xgboost as xgb
 from pathlib import Path
+from sklearn.calibration import CalibratedClassifierCV
 
-import config
+# --- 1. Configuration ---
+META_LEARNER_PATH = Path("models/meta_learner_calibrated.pkl")
 
-META_LEARNER_PATH = Path(
-    os.environ.get("FINDETECT_META_LEARNER_PATH", config.REPO_ROOT / "models" / "meta_learner_v1.joblib")
-)
-
-# Features the meta-learner uses (must match training)
-META_FEATURE_COLS = [
-    # Base model scores
-    "xgb_prob", "anomaly_score", "behavioral_score",
-    # Graph features
-    "base_risk", "graph_penalty", "hop1_count", "hop2_count", "hop3_count",
-    "bidir_count", "fan_score", "daily_degree",
-    # Customer deviation features (added by customer_deviation_node)
-    "amount_vs_own_mean", "amount_vs_own_median", "amount_zscore_vs_own",
-    "velocity_vs_own_avg",
-    # Interaction features (computed on-the-fly)
-]
-
-
+# --- 2. Feature Builder ---
 def _build_meta_features(df: pd.DataFrame) -> pd.DataFrame:
-
-    """Build the feature matrix for the meta-learner from base scores + graph features."""
-    X = pd.DataFrame(index=df.index)
-
-    # Base model scores
-    for col in ["xgb_prob", "anomaly_score", "behavioral_score"]:
-        X[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0).clip(0.0, 1.0)
-
-    # Graph features
-    for col in ["base_risk", "graph_penalty", "hop1_count", "hop2_count", "hop3_count",
-                "bidir_count", "fan_score", "daily_degree"]:
-        if col in df.columns:
-            X[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-        else:
-            X[col] = 0.0
-
+    # Core model scores
+    feature_cols = ["xgb_prob", "anomaly_score", "behavioral_score"]
+    
     # Customer deviation features
-    for col in ["amount_vs_own_mean", "amount_vs_own_median", "amount_zscore_vs_own", "velocity_vs_own_avg"]:
-        if col in df.columns:
-            X[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-        else:
-            X[col] = 0.0
-
-    # === INTERACTION FEATURES (this is where the magic happens) ===
-    # When multiple models agree, risk is multiplicative, not additive
-    X["ae_x_beh"] = X["anomaly_score"] * X["behavioral_score"]
-    X["ae_x_xgb"] = X["anomaly_score"] * X["xgb_prob"]
-    X["beh_x_xgb"] = X["behavioral_score"] * X["xgb_prob"]
-    X["all_three_high"] = (
-        (X["anomaly_score"] > 0.80) &
-        (X["behavioral_score"] > 0.40) &
-        (X["xgb_prob"] > 0.05)
-    ).astype(float)
-    X["two_high"] = (
-        ((X["anomaly_score"] > 0.80).astype(int) +
-         (X["behavioral_score"] > 0.40).astype(int) +
-         (X["xgb_prob"] > 0.05).astype(int)) >= 2
-    ).astype(float)
-
-    X["max_score"] = X[["xgb_prob", "anomaly_score", "behavioral_score"]].max(axis=1)
-    X["min_score"] = X[["xgb_prob", "anomaly_score", "behavioral_score"]].min(axis=1)
-    X["score_spread"] = X["max_score"] - X["min_score"]
-    X["mean_score"] = X[["xgb_prob", "anomaly_score", "behavioral_score"]].mean(axis=1)
-
-    # Graph × model interactions
-    X["graph_x_ae"] = X["graph_penalty"] * X["anomaly_score"]
-    X["hop1_x_base"] = (X["hop1_count"] > 0).astype(float) * X["base_risk"]
-    X["bidir_x_ae"] = (X["bidir_count"] > 0).astype(float) * X["anomaly_score"]
-
-    # Customer deviation × model interactions
-    X["deviation_x_ae"] = X["amount_zscore_vs_own"].clip(-3, 10) * X["anomaly_score"]
-
-    # Sanitize
-    X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    deviation_cols = [
+        "amount_vs_own_mean", "amount_vs_own_median", 
+        "amount_zscore_vs_own", "velocity_vs_own_avg"
+    ]
+    
+    # FIX: Match the exact column names output by graph_context_node
+    graph_cols = [
+        "hop1_count", "hop2_count", 
+        "bidir_count", "fan_score"
+    ]
+    
+    # Safely filter to only columns that actually exist
+    existing_cols = [col for col in feature_cols + deviation_cols + graph_cols if col in df.columns]
+    
+    X = df[existing_cols].fillna(0).copy()
     return X
 
-
-def predict_with_meta_learner(df: pd.DataFrame) -> np.ndarray:
+# --- 3. Inference Function (Used by nodes.py) ---
+def predict_with_meta_learner(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Use trained meta-learner to produce final risk scores.
-    Returns array of probabilities in [0, 1].
+    Loads the calibrated model and appends the meta_learner_score to the dataframe.
     """
     if not META_LEARNER_PATH.exists():
-        raise FileNotFoundError(
-            f"Meta-learner model not found at {META_LEARNER_PATH}. "
-            f"Run `python train_meta_learner.py` first."
-        )
-
+        raise FileNotFoundError(f"Model not found at {META_LEARNER_PATH}. Train it first!")
+    
     model = joblib.load(META_LEARNER_PATH)
     X = _build_meta_features(df)
+    
+    # Predict probabilities and assign to the positive class (index 1)
+    df = df.copy()
+    df["meta_learner_score"] = model.predict_proba(X)[:, 1] 
+    return df
 
-    # Ensure feature order matches training
-    expected_features = model.feature_names_in_
-    missing = [f for f in expected_features if f not in X.columns]
-    if missing:
-        raise ValueError(f"Meta-learner missing features at inference: {missing}")
-    X = X[expected_features]
-
-    probabilities = model.predict_proba(X)[:, 1].astype(np.float32)
-    return np.clip(probabilities, 0.0, 1.0)
-
-
+# --- 4. Training Function (The Fixed Patch) ---
 def train_meta_learner(scored_df: pd.DataFrame, label_col: str = "Is Laundering"):
     """
-    Train the meta-learner on labeled, scored data.
-    Call this ONCE via `train_meta_learner.py`.
+    Train the meta-learner on labeled, scored data, with probability
+    calibration so predict_proba actually reflects real probabilities.
     """
     print(f"🔧 Training meta-learner on {len(scored_df)} rows...")
 
@@ -124,38 +64,34 @@ def train_meta_learner(scored_df: pd.DataFrame, label_col: str = "Is Laundering"
 
     n_pos = y.sum()
     n_neg = len(y) - n_pos
-    scale_pos_weight = n_neg / max(n_pos, 1)
-    print(f"   Class distribution: {n_pos} positive, {n_neg} negative, scale_pos_weight={scale_pos_weight:.1f}")
+    raw_ratio = n_neg / max(n_pos, 1)
 
-    model = xgb.XGBClassifier(
-        n_estimators=300,
-        max_depth=5,
-        learning_rate=0.05,
-        scale_pos_weight=scale_pos_weight,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        min_child_weight=10,
-        gamma=0.1,
-        reg_alpha=0.1,
-        reg_lambda=1.0,
-        eval_metric="aucpr",          # PR-AUC is better for imbalanced data
-        use_label_encoder=False,
-        tree_method="hist",
-        random_state=42,
-        n_jobs=-1,
+
+    scale_pos_weight = min(raw_ratio ** 0.7, 40.0)
+    print(f"   Class distribution: {n_pos} pos, {n_neg} neg | scale_pos_weight={scale_pos_weight:.1f} (Balanced Mode)")
+
+    base_model = xgb.XGBClassifier(
+        n_estimators=300, max_depth=5, learning_rate=0.05,
+        scale_pos_weight=scale_pos_weight, subsample=0.8, colsample_bytree=0.8,
+        min_child_weight=10, gamma=0.1, reg_alpha=0.1, reg_lambda=1.0,
+        eval_metric="aucpr", tree_method="hist", random_state=42, n_jobs=-1,
     )
 
-    model.fit(X, y, verbose=50)
+    # FIX 2: calibrate predict_proba using isotonic regression
+    print("   Wrapping in CalibratedClassifierCV (isotonic, cv=3)...")
+    model = CalibratedClassifierCV(base_model, method="isotonic", cv=3)
+    model.fit(X, y)
+
+    mean_pred = model.predict_proba(X)[:, 1].mean()
+    true_base_rate = n_pos / len(y)
+    print(f"   ✅ Post-calibration mean prob: {mean_pred:.4f} (True base rate: {true_base_rate:.4f})")
+    
+    if abs(mean_pred - true_base_rate) > 0.01:
+        print("   ⚠️  WARNING: Calibration gap is > 1%. Check data leakage or try method='sigmoid'.")
 
     # Save
     META_LEARNER_PATH.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, META_LEARNER_PATH)
     print(f"✅ Meta-learner saved to {META_LEARNER_PATH}")
-
-    # Feature importance
-    importance = pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=False)
-    print("\n📊 Top 15 Meta-Learner Features:")
-    for feat, imp in importance.head(15).items():
-        print(f"   {feat:30s} {imp:.4f}")
 
     return model

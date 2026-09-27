@@ -629,40 +629,35 @@ def risk_agent_node(state: dict) -> dict:
     )
     results["investigation_flag"] = results["final_risk_score"] >= investigation_threshold
 
+
     # ============================================================================
-    # HARD RULE AUTO-CLEAR FILTERS (OPTIMIZED FOR META-LEARNER)
+    # HARD RULE AUTO-CLEAR FILTERS (OPTIMIZED FOR MAXIMUM RECALL)
     # ============================================================================
     flagged_accounts = results[results["investigation_flag"]].copy()
     initial_queue_size = len(flagged_accounts)
     
-    # Filter 1: Very mild base_risk check (lowered to let meta-learner do its job)
+    # Filter 1: Keep only a very mild base_risk check to filter absolute noise
     if "base_risk" in flagged_accounts.columns:
         flagged_accounts = flagged_accounts[flagged_accounts["base_risk"] >= 0.05]
         print(f"Filter 1 (base_risk >= 0.05): {initial_queue_size} → {len(flagged_accounts)}")
     
-    # Filter 2: Highly permissive. Trust the meta-learner's combined score.
-    # Only filter out accounts that have absolutely ZERO signal anywhere.
+    # Filter 2: MAXIMUM RECALL MODE - Remove strict signal checks
+    # We want to catch TPs even if they only have a weak signal in one area
     if "hop1_count" in flagged_accounts.columns:
         has_anomaly = "anomaly_score" in flagged_accounts.columns
         
         if has_anomaly:
             flagged_accounts = flagged_accounts[
-                (flagged_accounts["hop1_count"] >= 1) |       # Has graph exposure
-                (flagged_accounts["base_risk"] >= 0.10) |     # OR minimal base signal
-                (flagged_accounts["anomaly_score"] >= 0.80) | # OR moderate anomaly signal
-                (flagged_accounts["behavioral_score"] >= 0.30)# OR moderate behavioral signal
-            ]
-            print(f"Filter 2 (permissive signal check): → {len(flagged_accounts)}")
-        else:
-            flagged_accounts = flagged_accounts[
-                (flagged_accounts["hop1_count"] >= 1) |
-                (flagged_accounts["base_risk"] >= 0.10)
+                (flagged_accounts["hop1_count"] >= 1) |       # Has ANY graph exposure
+                (flagged_accounts["base_risk"] >= 0.12) |     # Lowered significantly
+                (flagged_accounts["anomaly_score"] >= 0.55) | # Lowered to catch more Autoencoder hits
+                (flagged_accounts["behavioral_score"] >= 0.25)# Lowered to catch more behavioral hits
             ]
             print(f"Filter 2 (permissive signal check): → {len(flagged_accounts)}")
     
-    # Filter 3: Final score sanity check (matches relaxed INVESTIGATION_THRESHOLD)
-    flagged_accounts = flagged_accounts[flagged_accounts["final_risk_score"] >= 0.28]
-    print(f"Filter 3 (final_risk_score >= 0.28): → {len(flagged_accounts)}")
+    # Filter 3: The main driver of volume. Enforce the new low threshold.
+    flagged_accounts = flagged_accounts[flagged_accounts["final_risk_score"] >= investigation_threshold]
+    print(f"Filter 3 (final_risk_score >= {investigation_threshold}): → {len(flagged_accounts)}")
     
     final_queue_size = len(flagged_accounts)
     reduction_pct = ((initial_queue_size - final_queue_size) / initial_queue_size * 100) if initial_queue_size > 0 else 0
@@ -731,7 +726,8 @@ def risk_agent_node(state: dict) -> dict:
         f"Risk agent results | high={high_count} | medium={med_count} | "
         f"low={low_count} | routed for investigation={len(flagged_accounts)}"
     )
-
+    flagged_accounts["graph_date"] = flagged_accounts["graph_date"].astype(str)
+    # results.to_parquet("risk_scores_for_threshold_analysis.parquet")
     return {
         "risk_scores": results,
         "final_insights": flagged_accounts.to_dict(orient="records"),
@@ -903,54 +899,75 @@ def evaluation_node(state: dict) -> dict:
         print(f"ℹ️ Ground truth column '{true_label_col}' not found. Skipping evaluation metrics.")
         return {}
 
-    print(f"--- STARTING PIPELINE EVALUATION ON {len(val_df)} TRANSACTIONS ---")
+    print(f"--- STARTING PIPELINE EVALUATION ---")
+    
+    # 1. Individual models are still evaluated at transaction level (that's fine)
     y_true_trans = val_df[true_label_col].astype(int).to_numpy()
-
     ml_probs = state.get("ml_probabilities", {})
 
-    # Individual model thresholds
     xgb_preds = np.array(ml_probs.get("xgb_prob", [])) >= 0.40
     ae_preds = np.array(ml_probs.get("anomaly_score", [])) >= 0.92
     beh_preds = np.array(ml_probs.get("behavioral_score", [])) >= 0.75
 
-    print("\n================ INDIVIDUAL MODEL PERFORMANCE ================")
+    print("\n================ INDIVIDUAL MODEL PERFORMANCE (Transaction Grain) ================")
     _print_metrics("XGBoost Model", y_true_trans, xgb_preds)
     _print_metrics("Autoencoder Anomaly Model", y_true_trans, ae_preds)
     _print_metrics("Behavioral Risk Model", y_true_trans, beh_preds)
 
-    # ========================================================================
-    # 🔥 CRITICAL FIX: Read from FILTERED 'risk_scores' (not raw graph data)
-    # ========================================================================
+    # 2. Risk Agent MUST be evaluated at Account/Day grain to be fair!
+    print("\n================ FINAL RISK AGENT PERFORMANCE (Account/Day Grain) ================")
     account_results = state.get("risk_scores", state["subgraph_data"]["account_results"])
-
-    val_df["_graph_date"] = pd.to_datetime(
-        val_df["Transaction_Date"] if "Transaction_Date" in val_df.columns else val_df["Timestamp"]
-    ).dt.normalize()
-
-    available_cols = [c for c in ["graph_date", "Account", "final_risk_score", "investigation_flag"]
-                      if c in account_results.columns]
-
-    evaluated_df = val_df.merge(
+    
+    # Aggregate ground truth to Account/Day grain: if ANY transaction is laundering, the day is positive.
+    date_col = "Transaction_Date" if "Transaction_Date" in val_df.columns else "Timestamp"
+    val_df["_graph_date"] = pd.to_datetime(val_df[date_col], errors="coerce").dt.normalize()
+    
+    account_day_truth = val_df.groupby(["_graph_date", "Account"])[true_label_col].max().reset_index()
+    account_day_truth.rename(columns={true_label_col: "is_laundering_day"}, inplace=True)
+    
+    # Merge with model predictions
+    available_cols = [c for c in ["graph_date", "Account", "final_risk_score", "investigation_flag"] if c in account_results.columns]
+    evaluated_days = account_day_truth.merge(
         account_results[available_cols],
         left_on=["_graph_date", "Account"],
         right_on=["graph_date", "Account"],
         how="left"
     )
+    
+    # Fill NA flags with False (accounts not flagged)
+    evaluated_days["investigation_flag"] = evaluated_days["investigation_flag"].fillna(False).astype(bool)
+    
+    y_true_days = evaluated_days["is_laundering_day"].astype(int).to_numpy()
+    y_pred_days = evaluated_days["investigation_flag"].to_numpy()
+    
+    _print_metrics("Risk Agent (Account/Day Alerts)", y_true_days, y_pred_days)
+    
+    # Print raw counts so you can see the real story
+    total_days = len(evaluated_days)
+    flagged_days = int(y_pred_days.sum())
+    tp_days = int((y_true_days & y_pred_days).sum())
+    
+    print(f"\n📊 Summary: Flagged {flagged_days} out of {total_days} Account/Days.")
+    print(f"   True Positive Days: {tp_days}")
+    if flagged_days > 0:
+        print(f"   ✅ Real Account/Day Precision: {tp_days / flagged_days:.4f} ({(tp_days / flagged_days)*100:.1f}%)")
 
-    # Fill NA with False for accounts filtered out by Hard Rules
-    agent_preds = evaluated_df["investigation_flag"].fillna(False).astype(bool).to_numpy()
-
-    print("\n================ FINAL RISK AGENT PERFORMANCE ================")
-    _print_metrics("Risk Agent (Investigation Flag Threshold - POST FILTER)", y_true_trans, agent_preds)
+    def to_native(metrics):
+        return tuple(float(x) if x is not None else None for x in metrics)
 
     return {
         "evaluation_metrics": {
-            "xgboost": precision_recall_fscore_support(y_true_trans, xgb_preds, average='binary', zero_division=0),
-            "autoencoder": precision_recall_fscore_support(y_true_trans, ae_preds, average='binary', zero_division=0),
-            "behavioral": precision_recall_fscore_support(y_true_trans, beh_preds, average='binary', zero_division=0),
-            "risk_agent_filtered": precision_recall_fscore_support(y_true_trans, agent_preds, average='binary', zero_division=0)
+            "xgboost": to_native(precision_recall_fscore_support(y_true_trans, xgb_preds, average='binary', zero_division=0)),
+            "autoencoder": to_native(precision_recall_fscore_support(y_true_trans, ae_preds, average='binary', zero_division=0)),
+            "behavioral": to_native(precision_recall_fscore_support(y_true_trans, beh_preds, average='binary', zero_division=0)),
+            "risk_agent_account_day": to_native(precision_recall_fscore_support(y_true_days, y_pred_days, average='binary', zero_division=0))
         }
     }
+
+
+
+
+
 
 
 # ---------------------------------------------------------------
@@ -965,7 +982,7 @@ def customer_deviation_node(state: dict) -> dict:
 
 
 # ---------------------------------------------------------------
-# 4.5 Meta-Learner Node (NEW — runs AFTER graph)
+# 4.5 Meta-Learner Node (FIXED)
 # ---------------------------------------------------------------
 def meta_learner_node(state: dict) -> dict:
     """
@@ -982,11 +999,23 @@ def meta_learner_node(state: dict) -> dict:
     date_col = "Transaction_Date" if "Transaction_Date" in df.columns else "Timestamp"
     df["_graph_date"] = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
 
+    # FIX 1: Explicitly attach the model scores from state["ml_probabilities"] 
+    # because the model nodes only return lists, not updated dataframes.
+    ml_probs = state.get("ml_probabilities", {})
+    for score_name in ["xgb_prob", "anomaly_score", "behavioral_score"]:
+        values = ml_probs.get(score_name)
+        if values is None:
+            raise ValueError(f"Meta-learner missing model score in state: {score_name}")
+        df[score_name] = (
+            pd.to_numeric(pd.Series(values, index=df.index), errors="coerce")
+            .replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(0.0, 1.0)
+        )
+
     # Aggregate model scores per account per day (use max — worst transaction drives risk)
     account_scores = df.groupby(["_graph_date", "Account"]).agg(
-        xgb_prob=("xgb_prob", "max") if "xgb_prob" in df.columns else ("Amount Paid", "size"),
-        anomaly_score=("anomaly_score", "max") if "anomaly_score" in df.columns else ("Amount Paid", "size"),
-        behavioral_score=("behavioral_score", "max") if "behavioral_score" in df.columns else ("Amount Paid", "size"),
+        xgb_prob=("xgb_prob", "max"),
+        anomaly_score=("anomaly_score", "max"),
+        behavioral_score=("behavioral_score", "max"),
         amount_vs_own_mean=("amount_vs_own_mean", "max") if "amount_vs_own_mean" in df.columns else ("Amount Paid", "size"),
         amount_vs_own_median=("amount_vs_own_median", "max") if "amount_vs_own_median" in df.columns else ("Amount Paid", "size"),
         amount_zscore_vs_own=("amount_zscore_vs_own", "max") if "amount_zscore_vs_own" in df.columns else ("Amount Paid", "size"),
@@ -1019,11 +1048,15 @@ def meta_learner_node(state: dict) -> dict:
 
     # Run meta-learner
     try:
-        meta_scores = predict_with_meta_learner(account_results)
-        account_results["meta_score"] = meta_scores
+        # FIX 2: predict_with_meta_learner returns the ENTIRE DataFrame with a new 
+        # 'meta_learner_score' column, not just a Series of scores. 
+        # We need to extract that specific column.
+        scored_df = predict_with_meta_learner(account_results)
+        account_results["meta_score"] = scored_df["meta_learner_score"]
+        
         print(
-            f"Meta-learner complete | min={meta_scores.min():.4f} | "
-            f"mean={meta_scores.mean():.4f} | max={meta_scores.max():.4f}"
+            f"Meta-learner complete | min={account_results['meta_score'].min():.4f} | "
+            f"mean={account_results['meta_score'].mean():.4f} | max={account_results['meta_score'].max():.4f}"
         )
     except FileNotFoundError as e:
         print(f"⚠️  {e}")
