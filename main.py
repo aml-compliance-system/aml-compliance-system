@@ -1,3 +1,4 @@
+# run fastapi
 import threading
 import ollama
 import config
