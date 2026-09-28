@@ -152,6 +152,8 @@ pip install -r requirements.txt
 ollama pull qwen2.5
 
 dataset: [https://drive.google.com/drive/u/0/folders/15Jb5T64Ua99DMZWRbz8ptRSEMY2KBLKQ]
+# pip install gdown if you want directly download file from drive
+# gdown --folder 15Jb5T64Ua99DMZWRbz8ptRSEMY2KBLKQ
 ```
 
 
