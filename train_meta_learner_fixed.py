@@ -31,7 +31,7 @@ BUG 3 -- Out-of-memory loading the full 55-day train window.
     shorter window instead.
 
 Usage:
-    python train_meta_learner_fixed.py --train-window 2022-08-08:2022-10-02 --input-glob "Data/processed/block_d_numerical_bucket_*.parquet" --neg-sample-rate 0.10
+    python train_meta_learner_fixed.py --train-window 2022-08-08:2022-08-25 --input-glob "Data/processed/block_d_numerical_bucket_*.parquet" --neg-sample-rate 0.10
 """
 import argparse
 
