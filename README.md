@@ -13,12 +13,13 @@
 5. [Requirements](#requirements)
 6. [Installation](#installation)
 7. [Usage](#usage)
-8. [Configuration](#configuration)
-9. [Data & Privacy](#data--privacy)
-10. [Limitations & Disclaimer](#limitations--disclaimer)
-11. [Contributing](#contributing)
-12. [License](#license)
-13. [Contact](#contact)
+8. [Evaluation Results](#evaluation-results)
+9. [Configuration](#configuration)
+10. [Data & Privacy](#data--privacy)
+11. [Limitations & Disclaimer](#limitations--disclaimer)
+12. [Contributing](#contributing)
+13. [License](#license)
+14. [Contact](#contact)
 
 ---
 
@@ -131,8 +132,8 @@ FINDETECT/
 
 ```bash
 # 1. Clone the repository
-git clone <your-repository-url>
-cd FINDETECT
+git clone https://github.com/aml-compliance-system/aml-compliance-system.git
+cd aml-compliance-system
 
 # 2. Create and activate a virtual environment
 python -m venv venv
@@ -142,7 +143,7 @@ source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
 # 4. Install Ollama (https://ollama.com) and pull the model used for explanations
-ollama pull <model-name>        # replace with the model configured in config.py
+ollama pull qwen2.5
 ```
 
 ---
@@ -189,13 +190,51 @@ Each run produces a risk score per transaction, an LLM-generated explanation, a 
 
 ---
 
+## Evaluation Results
+
+FINDETECT is evaluated at two levels: each detection model is scored per **transaction**, and the final Risk Agent is scored per **account/day**, which is the level at which a compliance analyst actually reviews alerts. Because the grains differ, the two tables should not be compared row by row.
+
+Suspicious activity is extremely rare in this data (about 0.18% of transactions and 0.53% of account/days), so accuracy is not a useful metric. Precision, recall and F1 on the suspicious class are reported instead.
+
+### Individual models (transaction level)
+
+| Model | Precision | Recall | F1-Score | TP | FP | FN | TN |
+|---|---|---|---|---|---|---|---|
+| XGBoost | 0.0315 | 0.0476 | 0.0379 | 230 | 7,074 | 4,603 | 2,749,343 |
+| Autoencoder (anomaly) | 0.0068 | 0.3296 | 0.0134 | 1,593 | 231,461 | 3,240 | 2,524,956 |
+| Behavioral Risk | 0.0717 | 0.0395 | 0.0510 | 191 | 2,472 | 4,642 | 2,753,945 |
+
+Each model captures a different trade-off. The autoencoder finds the most suspicious transactions (highest recall) but raises many false alarms, while the behavioral model is the most precise but misses most cases. No single model is sufficient on its own, which is the reason for the fusion step.
+
+### Final Risk Agent (account/day level)
+
+| Metric | Value |
+|---|---|
+| Precision | 0.1172 (11.7%) |
+| Recall | 0.7462 (74.6%) |
+| F1-Score | 0.2026 |
+| True Positives | 3,122 |
+| False Positives | 23,511 |
+| False Negatives | 1,062 |
+| True Negatives | 761,380 |
+
+Of 789,075 account/days, the Risk Agent flagged 26,633 (about 3.4%) and caught 3,122 of the 4,184 truly suspicious ones. That is roughly 22 times more precise than reviewing account/days at random (base rate 0.53%), while recovering about three quarters of the suspicious activity.
+
+### Reading these results
+
+- The combined Risk Agent reaches far higher recall (74.6%) than any individual model (at most 33%), which shows the benefit of fusing models and graph context.
+- Precision is still low in absolute terms (11.7%), so most alerts are false positives and need human review. Alert volume and precision can be traded off by adjusting the decision threshold (see `threshold_report/`).
+- These figures come from one dataset and one configuration. Re-evaluate on your own data before operational use.
+
+---
+
 ## Configuration
 
 Settings are managed in `config.py`. Typical values to set include:
 
 - Data paths and database location
 - Model and threshold settings
-- Ollama model name and server address (by default Ollama listens on `http://localhost:11434`)
+- Ollama model name (default: `qwen2.5`) and server address (by default Ollama listens on `http://localhost:11434`)
 
 Because the LLM runs locally, no API key is required. If you add other secrets or credentials later, store them in environment variables or a local `.env` file excluded through `.gitignore`.
 
@@ -236,12 +275,12 @@ Please keep changes focused, and include tests or sample results where possible.
 
 ## License
 
-*Add your chosen license here (for example MIT or Apache 2.0) and include a `LICENSE` file in the repository.*
+This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
 
 ---
 
 ## Contact
 
-**Team:** *FINDETECT team name*
-**Email:** *your-email@example.com*
-**Project link:** *repository URL*
+**Team:** FINDETECT team SDAA
+**Email:** [jawadaljabbar@gmail.com](mailto:jawadaljabbar@gmail.com)
+**Repository:** [github.com/aml-compliance-system/aml-compliance-system](https://github.com/aml-compliance-system/aml-compliance-system)
