@@ -1,38 +1,3 @@
-"""
-Final corrected meta-learner training script.
-
-Fixes THREE bugs found across this debugging session:
-
-BUG 1 -- Trained and evaluated on the SAME data.
-    config.DEFAULT_PARQUET_PATH points at prod_sample_oct23_25.parquet --
-    the held-out window. Training the meta-learner on it means every later
-    "held-out" evaluation against that file measures memorization, not
-    generalization.
-    FIX: --train-window must be a DIFFERENT window than whatever you
-    evaluate the pipeline against.
-
-BUG 2 -- Training grain != inference grain (caused the 99.1% flood).
-    meta_learner_node MAX-aggregates xgb_prob/anomaly_score/behavioral_score
-    across every transaction an account made that day before scoring. The
-    original script trained on per-transaction values instead, so the model
-    never saw the (systematically higher) max-aggregated values it would be
-    scored on at inference.
-    FIX: aggregate to ACCOUNT/DAY grain with the same max() aggregation
-    meta_learner_node uses, for both features and label, before training.
-
-BUG 3 -- Out-of-memory loading the full 55-day train window.
-    Your original training notebook queried with a 10% negative-sample
-    filter for exactly this reason: `Is Laundering = 1 OR random() < 0.10`.
-    Keep ALL positives (extremely rare), downsample negatives. My first
-    version of this script dropped that and tried to load the whole window
-    unsampled -> OOM on a 55-day range.
-    FIX: --neg-sample-rate (default 0.10) reproduces the original notebook's
-    approach. Set to 1.0 to disable sampling if you have the RAM / use a
-    shorter window instead.
-
-Usage:
-    python train_meta_learner_fixed.py --train-window 2022-08-08:2022-08-25 --input-glob "Data/processed/block_d_numerical_bucket_*.parquet" --neg-sample-rate 0.10
-"""
 import argparse
 
 import duckdb

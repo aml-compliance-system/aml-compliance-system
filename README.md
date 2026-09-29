@@ -431,5 +431,5 @@ This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) f
 - [jawadaljabbar@gmail.com](mailto:jawadaljabbar@gmail.com)
 - [shooq.otibii@gmail.com](mailto:shooq.otibii@gmail.com)
 - [Dalalalsolami2d@gmail.com](mailto:Dalalalsolami2d@gmail.com)
+- [shahad.a.aldossarii@gmail.com ](shahad.a.aldossarii@gmail.com )
 
-**Repository:** [github.com/aml-compliance-system/aml-compliance-system](https://github.com/aml-compliance-system/aml-compliance-system)

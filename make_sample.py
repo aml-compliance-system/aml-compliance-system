@@ -1,12 +1,4 @@
 
-# result = duckdb.sql("""
-#     SELECT MIN(Timestamp) AS min_ts, MAX(Timestamp) AS max_ts
-#     FROM read_parquet('Data/processed/block_d_numerical_bucket_*.parquet')
-# """).df()
-
-# print(result)
-
-
 """
 Build a production sample from bucketed Block D parquet files.
 
