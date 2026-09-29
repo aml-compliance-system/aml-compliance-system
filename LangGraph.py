@@ -178,5 +178,4 @@ if __name__ == "__main__":
         print(
             "\\n✅ Pipeline finished safely. "
             "No account/day cases crossed "
-            "the 0.50 investigation threshold."
         )

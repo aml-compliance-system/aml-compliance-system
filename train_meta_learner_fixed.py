@@ -156,13 +156,14 @@ def main():
     con = duckdb.connect()
     con.execute(f"SELECT setseed({args.seed / 2147483647.0})")  # deterministic random()
 
+    time_filter = (
+        f"Timestamp >= '{start_str}' "
+        f"AND Timestamp < CAST('{end_str}' AS DATE) + INTERVAL 1 DAY"
+    )
     if args.neg_sample_rate >= 1.0:
-        where_clause = f"Timestamp >= '{start_str}' AND Timestamp <= '{end_str}'"
+        where_clause = time_filter
     else:
-        where_clause = (
-            f"Timestamp >= '{start_str}' AND Timestamp <= '{end_str}' "
-            f"AND (\"Is Laundering\" = 1 OR random() < {args.neg_sample_rate})"
-        )
+        where_clause = f"{time_filter} AND (\"Is Laundering\" = 1 OR random() < {args.neg_sample_rate})"
 
     print(f"Loading training window {start_str} -> {end_str} "
           f"(neg-sample-rate={args.neg_sample_rate}) from {input_glob} ...")
@@ -185,7 +186,8 @@ def main():
     print(f"Training rows (account/day grain): {len(training_table):,}")
     print(f"Positive account/days: {int(training_table['Is Laundering'].sum()):,}")
 
-    train_meta_learner(training_table, label_col="Is Laundering")
+    train_meta_learner(training_table, label_col="Is Laundering",
+                       neg_sample_rate=args.neg_sample_rate)
 
     print("\n✅ DONE. Retrained on account/day grain, matching meta_learner_node's inference features.")
     print(f"   Trained on window {start_str} -> {end_str} with neg-sample-rate={args.neg_sample_rate}.")

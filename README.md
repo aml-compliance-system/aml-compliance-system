@@ -30,7 +30,7 @@ Financial institutions and regulators must identify suspicious activity across v
 FINDETECT addresses this by running every transaction batch through a multi-stage pipeline:
 
 - Several independent detection models look at the data from different angles (supervised, unsupervised, and behavioral).
-- A **meta-learner** fuses their outputs into one calibrated risk score.
+- A **meta-learner** fuses their outputs into one risk score per account per day. It is a ranking score, not a calibrated probability (see [Limitations](#limitations--disclaimer)).
 - A **risk agent** and an **LLM** turn the score into a human-readable explanation.
 - A final **evaluation** step measures how well the pipeline performed.
 
@@ -100,7 +100,7 @@ Shared data moves between stages through a custom state object (`AMLPipelineStat
 ```
 FINDETECT/
 ├── frontend/                        # Web dashboard (HTML): case list and AI investigation chat
-├── models/                          # Trained models (incl. autoencoder_final64/)
+├── models/                          # Trained models (incl. autoencoder_final64/ and meta_learner_calibrated.pkl)
 ├── Data/processed/                  # 64 input Parquet files: block_d_numerical_bucket_000 to 063 (not committed to Git)
 ├── outputs/                         # Pipeline results, one folder per run (generated)
 ├── pre_model/                       # Pre-trained / preliminary model artifacts
@@ -118,6 +118,9 @@ FINDETECT/
 ├── train_meta_learner_fixed.py      # Trains the meta-learner
 ├── run_full_pipeline.py             # Command-line runner (--input file and/or --date YYYY-MM-DD)
 ├── run_all_days.py                  # Runs the pipeline across multiple days
+├── pick_threshold.py                # Picks the investigation threshold for a chosen recall
+├── pick_tiers.py                    # Derives investigation, watchlist and tier cutoffs from a run
+├── eval_days.parquet                # Account/day results of the last evaluated run (generated)
 ├── risk_scores_for_threshold_analysis.parquet  # Exported scores for threshold analysis
 ├── data.duckdb                      # Local DuckDB database
 ├── requirements.txt                 # Python dependencies
@@ -204,11 +207,42 @@ python run_all_days.py
 
 ```bash
 python make_sample.py               # generate sample data
-python train_meta_learner_fixed.py  # train the meta-learner
 python optimize_fusion_weights.py   # optimize fusion weights
 ```
 
-### 6. Use the pipeline programmatically
+### 6. Train the meta-learner
+
+The meta-learner is trained on **account/day** rows built with the same aggregation used at inference (maximum of each model score per account per day, plus graph and customer-deviation features).
+
+```bash
+python train_meta_learner_fixed.py \
+    --train-window <START>:<END> \
+    --input-glob "Data/processed/block_d_numerical_bucket_*.parquet" \
+    --neg-sample-rate 0.5
+```
+
+| Argument | Meaning |
+|---|---|
+| `--train-window` | Date window to train on (`YYYY-MM-DD:YYYY-MM-DD`, end date included). It must **not overlap** the window you evaluate on. |
+| `--neg-sample-rate` | Fraction of non-suspicious transactions kept, to fit in memory. All suspicious transactions are always kept. The reported results use `0.5`. `1.0` disables sampling. |
+
+Things to know:
+
+- The trained model is saved to `models/meta_learner_calibrated.pkl`, with its sampling rate in a `.json` file next to it. **Back up the file before retraining**, because a new run overwrites it.
+- The graph features (`hop1_count`, `bidir_count`, and so on) are computed on the sampled transactions, so a lower sampling rate gives a thinner graph in training than at inference. Higher rates match inference better but use more memory.
+- The graph features depend on the seed threshold and the fusion weights in `config.py`. **Retrain the meta-learner whenever you change either.**
+- The scores are not probabilities. Sampling and calibration shift their scale, so choose thresholds from data (next section), not from a fixed number such as 0.5.
+
+### 7. Choose the alert thresholds
+
+1. Run the pipeline on a **tuning window**. The evaluation step writes `eval_days.parquet` (one row per account/day with its score and the true label).
+2. Run `python pick_threshold.py` to see the precision you get at each recall level, or `python pick_tiers.py --recall 0.75` to derive the investigation, watchlist and tier cutoffs together.
+3. Put the chosen values in `config.py`.
+4. Run the pipeline on a **different window** without changing anything and report those numbers.
+
+Choosing the thresholds and reporting results on the same window makes the results look better than they will be on new data.
+
+### 8. Use the pipeline programmatically
 
 ```python
 from LangGraph import app
@@ -217,7 +251,7 @@ final_state = app.invoke({"final_parquet_path": "path/to/daily_file.parquet"})
 risk_scores = final_state["risk_scores"]   # pandas DataFrame, one row per account/day
 ```
 
-### 7. Run the web dashboard
+### 9. Run the web dashboard
 
 The dashboard lets an analyst run the pipeline, review flagged accounts, and chat with an AI investigator about each case. It has two parts that run in two separate terminals, both started from the project folder.
 
@@ -272,37 +306,44 @@ FINDETECT is evaluated at two levels: each detection model is scored per **trans
 
 Suspicious activity is extremely rare in this data (about 0.18% of transactions and 0.53% of account/days), so accuracy is not a useful metric. Precision, recall and F1 on the suspicious class are reported instead.
 
+**Evaluation data:** `Data/processed/prod_sample_oct23_25.parquet`, 2,761,250 transactions from 23 to 25 October 2022 (4,833 suspicious transactions). At account/day level that is 789,075 account/days, of which 4,184 are suspicious. The meta-learner was trained on an earlier window that does not overlap this one.
+
 ### Individual models (transaction level)
 
-Decision thresholds used for evaluation: XGBoost probability >= 0.40, autoencoder anomaly score >= 0.92, behavioral score >= 0.75.
+Decision thresholds used for evaluation: XGBoost probability >= 0.50, autoencoder anomaly score >= 0.98, behavioral score >= 0.40. They were chosen from threshold sweeps (printed by the evaluation step) on this same data, so these three rows are somewhat optimistic.
 
 | Model | Precision | Recall | F1-Score | TP | FP | FN | TN |
 |---|---|---|---|---|---|---|---|
-| XGBoost | 0.0315 | 0.0476 | 0.0379 | 230 | 7,074 | 4,603 | 2,749,343 |
-| Autoencoder (anomaly) | 0.0068 | 0.3296 | 0.0134 | 1,593 | 231,461 | 3,240 | 2,524,956 |
-| Behavioral Risk | 0.0717 | 0.0395 | 0.0510 | 191 | 2,472 | 4,642 | 2,753,945 |
+| XGBoost | 0.1234 | 0.0368 | 0.0567 | 178 | 1,264 | 4,655 | 2,755,153 |
+| Autoencoder (anomaly) | 0.0093 | 0.1202 | 0.0173 | 581 | 61,674 | 4,252 | 2,694,743 |
+| Behavioral Risk | 0.0509 | 0.1386 | 0.0744 | 670 | 12,503 | 4,163 | 2,743,914 |
 
-Each model captures a different trade-off. The autoencoder finds the most suspicious transactions (highest recall) but raises many false alarms, while the behavioral model is the most precise but misses most cases. No single model is sufficient on its own, which is the reason for the fusion step.
+The models behave very differently. XGBoost is the most precise at high scores (about 77% precision at a score of 0.75, with very few cases caught), the behavioral model is moderately precise and catches more, and the autoencoder is only slightly better than random (about 5x the base rate at its strictest cutoff). No single model is sufficient on its own, which is the reason for the fusion step.
 
 ### Final Risk Agent (account/day level)
 
 | Metric | Value |
 |---|---|
-| Precision | 0.1172 (11.7%) |
-| Recall | 0.7462 (74.6%) |
-| F1-Score | 0.2026 |
-| True Positives | 3,122 |
-| False Positives | 23,513 |
-| False Negatives | 1,062 |
-| True Negatives | 761,378 |
+| Precision | 0.1165 (11.7%) |
+| Recall | 0.7517 (75.2%) |
+| F1-Score | 0.2017 |
+| True Positives | 3,145 |
+| False Positives | 23,849 |
+| False Negatives | 1,039 |
+| True Negatives | 761,042 |
 
-Of 789,075 account/days, the Risk Agent flagged 26,635 (about 3.4%) and caught 3,122 of the 4,184 truly suspicious ones. That is roughly 22 times more precise than reviewing account/days at random (base rate 0.53%), while recovering about three quarters of the suspicious activity.
+Of 789,075 account/days, the Risk Agent flagged 26,994 (about 3.4%) and caught 3,145 of the 4,184 truly suspicious ones. That is roughly 22 times more precise than reviewing account/days at random (base rate 0.53%), while recovering about three quarters of the suspicious activity.
+
+### Choosing an operating point
+
+The numbers above are a **high-recall** setting (about 75% recall). Raising the investigation threshold sends fewer accounts to review and makes each alert more likely to be real, but misses more suspicious accounts. Lowering it does the reverse. Across the configurations tested, precision at a fixed recall level was similar, so the threshold is mainly a choice about review capacity: how many alerts per day your analysts can work through. Use `pick_threshold.py` and `pick_tiers.py` to see the trade-off on your data.
 
 ### Reading these results
 
-- The combined Risk Agent reaches far higher recall (74.6%) than any individual model (at most 33%), which shows the benefit of fusing models and graph context.
-- Precision is still low in absolute terms (11.7%), so most alerts are false positives and need human review. Alert volume and precision can be traded off by adjusting the decision threshold (see `threshold_report/`).
-- These figures come from one dataset and one configuration. Re-evaluate on your own data before operational use.
+- The combined Risk Agent reaches far higher recall (75.2%) than any individual model (at most 14% at the thresholds above), which shows the benefit of fusing models and graph context.
+- Precision is still low in absolute terms (11.7%), so most alerts are false positives and need human review.
+- The ceiling is set by the base models. If none of them scores a suspicious account highly, the fusion step cannot recover it. Better input features would help more than further threshold changes.
+- These figures come from one dataset and one configuration, and the thresholds were tuned on the same window. Re-evaluate on a separate window and on your own data before operational use.
 
 ---
 
@@ -316,6 +357,18 @@ Thresholds, model paths, fusion weights and penalties are defined in `config.py`
 | `AUTOENCODER_MODEL_DIR` | Folder with the autoencoder package | `models/autoencoder_final64` |
 | `FINDETECT_OUTPUT_DIR` | Where results are saved | `outputs/FINDETECT_Pipeline_Output` |
 | `FINDETECT_TEMP_DIR` | Temporary daily Parquet files | `.tmp/findetect_daily` |
+
+Thresholds and weights that shape the results:
+
+| Variable | Purpose |
+|---|---|
+| `FINDETECT_XGB_WEIGHT`, `FINDETECT_ANOMALY_WEIGHT`, `FINDETECT_BEHAVIORAL_WEIGHT` | Weights that combine the three model scores into `base_risk` (must sum to 1.0). |
+| `FINDETECT_SEED_THRESHOLD` | `base_risk` above which an account becomes a high-risk seed for graph exposure. |
+| `FINDETECT_INVESTIGATION_THRESHOLD` | Meta-learner score at or above which an account is sent for investigation. |
+| `FINDETECT_MEDIUM_RISK_THRESHOLD` | Score at or above which an unflagged account is labelled Medium Risk (watchlist). |
+| `FINDETECT_TIER_1_THRESHOLD`, `FINDETECT_TIER_2_THRESHOLD` | Score cutoffs for `TIER_1_HIGH` and `TIER_2_MEDIUM`. Everything else that is flagged is `TIER_3_LOW`. |
+
+The cutoffs must satisfy `MEDIUM <= INVESTIGATION <= TIER_2 <= TIER_1`, otherwise a tier ends up empty. Changing the fusion weights or the seed threshold changes the graph features, so retrain the meta-learner afterwards (see [Train the meta-learner](#6-train-the-meta-learner)).
 
 Example (Windows PowerShell):
 
@@ -346,7 +399,9 @@ Financial data is highly sensitive. When deploying FINDETECT:
 - Model performance depends on data quality and how closely the data matches the training data. Results should be validated on your own data before operational use.
 - SAR drafts are generated for the top 25 highest-risk cases per run by default, a limit chosen for local hardware. Production deployments with more compute can raise it so that every flagged case gets a draft. All flagged cases are still saved in `risk_scores.parquet`.
 - LLM-generated explanations are meant to assist review and may contain inaccuracies; they should not be treated as evidence.
-- Thresholds should be tuned and approved by your compliance team.
+- The risk score is a ranking score. It is not a calibrated probability of laundering, so do not read a score of 0.4 as a 40% chance.
+- Thresholds should be tuned and approved by your compliance team, on a window that is separate from the one used to report results.
+- Results were measured on one three-day window of one dataset. Performance on other periods may differ.
 
 ---
 

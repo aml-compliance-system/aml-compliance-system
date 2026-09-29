@@ -1,0 +1,18 @@
+{
+  "neg_sample_rate": 0.05,
+  "n_pos": 22037,
+  "n_neg": 2672506,
+  "features": [
+    "xgb_prob",
+    "anomaly_score",
+    "behavioral_score",
+    "amount_vs_own_mean",
+    "amount_vs_own_median",
+    "amount_zscore_vs_own",
+    "velocity_vs_own_avg",
+    "hop1_count",
+    "hop2_count",
+    "bidir_count",
+    "fan_score"
+  ]
+}
