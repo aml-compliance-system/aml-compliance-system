@@ -426,7 +426,7 @@ This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) f
 
 ## Contact
 
-**Team:** FINDETECT team SDAA
+**Team:** FINDETECT team SDA
 **Email:**
 - [jawadaljabbar@gmail.com](mailto:jawadaljabbar@gmail.com)
 - [shooq.otibii@gmail.com](mailto:shooq.otibii@gmail.com)
