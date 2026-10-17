@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Assistant · FINDETECT</title>
+  <link rel="stylesheet" href="assets/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside id="sidebar" class="sidebar"></aside>
+    <div class="app-main">
+      <header id="topbar" class="topbar"></header>
+      <main id="content" class="content">
+        <div class="chat-shell" id="chat-shell"></div>
+      </main>
+    </div>
+  </div>
+  <script type="module" src="assets/assistant.js"></script>
+  <script>
+    setTimeout(function () {
+      var sidebar = document.getElementById("sidebar");
+      var content = document.getElementById("content");
+      if (sidebar && !sidebar.children.length && content) {
+        content.innerHTML = '<div class="error-state" style="margin:24px"><h3>UI scripts did not load</h3><p>Open <strong>http://127.0.0.1:8000/ui/</strong> (recommended) or run <code>python serve_frontend.py --port 5600</code>. Do not use <code>python -m http.server</code>.</p></div>';
+      }
+    }, 2000);
+  </script>
+</body>
+</html>

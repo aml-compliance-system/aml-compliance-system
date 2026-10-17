@@ -140,7 +140,7 @@ def build_daily_parquet(run_date, input_path=None) -> Path:
     return daily_path
 
 
-def save_outputs(run_label: str, final_state: dict):
+def save_outputs(run_label: str, final_state: dict, input_parquet=None):
     output_dir = OUTPUT_ROOT / run_label
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -178,6 +178,11 @@ def save_outputs(run_label: str, final_state: dict):
         "graph_date": run_label,
         "sar_report_count": len(reports),
     }
+
+    # Record the transactions source so the agent/CLI can re-query evidence for
+    # this run after a restart.
+    if input_parquet:
+        summary["input_parquet"] = str(input_parquet)
 
     if isinstance(risk_scores, pd.DataFrame):
         summary["account_day_rows"] = len(risk_scores)
@@ -275,7 +280,9 @@ def main():
 
     print(f"\n✅ PIPELINE FINISHED FOR {run_label}")
 
-    save_outputs(run_label, final_state)
+    # Prefer the original file when one was supplied; otherwise record the
+    # prepared daily parquet so the agent can query transactions for this run.
+    save_outputs(run_label, final_state, input_parquet=args.input or daily_path)
 
     del final_state
     gc.collect()

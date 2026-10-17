@@ -51,6 +51,10 @@ The pipeline is orchestrated with [LangGraph](https://github.com/langchain-ai/la
 - **Threshold analysis**: risk scores can be exported and analyzed to choose operating thresholds.
 - **Batch processing**: run a single day or all days in a dataset.
 - **Web dashboard**: analysts run the pipeline from the browser, review flagged accounts, and chat with a local AI investigator about each case (FastAPI backend + HTML frontend).
+- **Case workspace**: real account/day cases with risk composition, transaction explorer, notes, timeline, graph and SAR in one case context.
+- **Interactive graph investigation**: bounded account/transaction graph with time-ordered path tracing, cycle detection, shared counterparties, connected components and evidence references.
+- **SAR workflow**: evidence-grounded draft, editing, missing-field validation, human review/approval and PDF/DOCX export. No external filing.
+- **Agentic investigator**: the chat LLM can call three read-only evidence tools (`get_account_scores`, `get_transactions`, `get_graph_exposure`), decide what to inspect, and answer with a trace of the evidence it used. See [Agentic AML Investigator](AGENTIC_AI.md).
 - **Local analytical storage** using DuckDB and Parquet for fast processing without a separate database server.
 
 ---
@@ -85,7 +89,7 @@ flowchart TD
 | **Graph Extraction** | Builds a daily transaction graph and adds context: exposure to high-risk accounts up to **3 hops**, **bidirectional flows** (layering indicator) and **fan-in / fan-out** patterns (money-mule indicator). Very high-degree accounts such as merchants are shielded from false seeding. |
 | **Meta-Learner** | A trained stacking model that fuses the three model scores, graph features and customer-deviation features into one risk score per account per day. If the trained meta-learner is not found, the pipeline falls back to the weighted-average risk score. |
 | **Risk Agent** | Applies the investigation threshold and signal filters, then sorts flagged accounts into `TIER_1_HIGH`, `TIER_2_MEDIUM` and `TIER_3_LOW` queues. |
-| **LLM API** | Builds a structured case for the highest-risk accounts (top 25 per run) and drafts a Suspicious Activity Report (SAR) using a local LLM served by Ollama. The default limit is 25 reports per run because of local hardware limits; it can be raised on stronger hardware (`MAX_REPORTS` in `nodes.py`). |
+| **LLM API** | Builds a structured case for the highest-risk accounts (top 25 per run) and writes deterministic legacy SAR template drafts. The investigator workspace creates new evidence-grounded, versioned drafts for any selected case. The pipeline limit of 25 reports is for local hardware; it can be raised on stronger hardware (`MAX_REPORTS` in `nodes.py`). |
 | **Report** | Assembles the final results. |
 | **Evaluation** | If ground-truth labels (`Is Laundering`) are present, computes precision, recall and F1 for each model and the Risk Agent. |
 
@@ -99,18 +103,32 @@ Shared data moves between stages through a custom state object (`AMLPipelineStat
 
 ```
 FINDETECT/
-├── frontend/                        # Web dashboard (HTML): case list and AI investigation chat
+├── frontend/                        # Investigator workspace: cases, case workspace, graph, assistant, SAR, settings
+│   └── assets/                      # Local CSS/JS modules (no build step)
 ├── models/                          # Trained models (incl. autoencoder_final64/ and meta_learner_calibrated.pkl)
 ├── Data/processed/                  # 64 input Parquet files: block_d_numerical_bucket_000 to 063 (not committed to Git)
-├── outputs/                         # Pipeline results, one folder per run (generated)
-├── pre_model/                       # Pre-trained / preliminary model artifacts
-├── threshold_report/                # Threshold analysis outputs
+├── outputs/                         # Pipeline results and local workflow DB (generated)
 ├── AMLPipelineState.py              # Shared pipeline state (with merge_dicts reducer)
+├── api_cases.py                     # Cases, transactions, case chat and meta routes
+├── api_graph.py                     # Bounded graph analysis routes
+├── api_notes.py                     # Notes and findings routes
+├── api_sar.py                       # SAR draft, review, approval and export routes
+├── case_service.py                  # Read-only case/transaction/Parquet access
+├── graph_algorithms.py              # Time-ordered paths/cycles, shared counterparties, components
+├── graph_service.py                 # Bounded graph loading and case graph responses
+├── workflow_store.py                # SQLite case state, notes, SAR versions and append-only audit
+├── sar_service.py                   # Evidence-grounded draft, validation, approval and export
+├── docx_writer.py / pdf_writer.py   # Dependency-free DOCX/PDF export
+├── schemas.py / security.py         # Typed API models, token gate and input sandbox
+├── agent.py                         # Tool-calling AML investigator (Ollama + offline fallback)
+├── agent_cli.py                     # CLI for the evidence tools and investigator
+├── tools.py                         # Read-only evidence tools used by the LLM
+├── tests/                           # Backend, real-data, graph, SAR and frontend contract tests
 ├── config.py                        # Central configuration
 ├── customer_deviation.py            # Customer behavior deviation logic
 ├── LangGraph.py                     # Pipeline graph definition and compilation
-├── LLM.py                           # LLM integration for explanations
-├── main.py                          # FastAPI backend for the web dashboard
+├── LLM.py                           # Deterministic SAR template
+├── main.py                          # FastAPI application and entry point
 ├── make_sample.py                   # Generates sample data
 ├── meta_learner.py                  # Meta-learner model
 ├── nodes.py                         # Node implementations for each pipeline stage
@@ -118,12 +136,11 @@ FINDETECT/
 ├── train_meta_learner_fixed.py      # Trains the meta-learner
 ├── run_full_pipeline.py             # Command-line runner (--input file and/or --date YYYY-MM-DD)
 ├── run_all_days.py                  # Runs the pipeline across multiple days
+├── serve_frontend.py                # Local frontend server with correct JS MIME types
 ├── pick_threshold.py                # Picks the investigation threshold for a chosen recall
 ├── pick_tiers.py                    # Derives investigation, watchlist and tier cutoffs from a run
-├── eval_days.parquet                # Account/day results of the last evaluated run (generated)
-├── risk_scores_for_threshold_analysis.parquet  # Exported scores for threshold analysis
-├── data.duckdb                      # Local DuckDB database
 ├── requirements.txt                 # Python dependencies
+├── AGENTIC_AI.md                    # Agent design, tools and fallback behavior
 └── README.md
 ```
 
@@ -251,42 +268,115 @@ final_state = app.invoke({"final_parquet_path": "path/to/daily_file.parquet"})
 risk_scores = final_state["risk_scores"]   # pandas DataFrame, one row per account/day
 ```
 
-### 9. Run the web dashboard
+### 9. Run the investigator workspace
 
-The dashboard lets an analyst run the pipeline, review flagged accounts, and chat with an AI investigator about each case. It has two parts that run in two separate terminals, both started from the project folder.
+The workspace is a case-centered investigation application on top of the existing pipeline.
 
-**Terminal 1: the API (port 8000)**
+**Recommended: one server (API + UI)**
 
-```bash
+```powershell
 uvicorn main:app --reload
 ```
 
-`--reload` restarts the server when Python files change, which is convenient during development. For a deployment, run without it.
+Open **`http://127.0.0.1:8000/ui/`** (or `http://127.0.0.1:8000/`, which redirects there). The API serves the frontend with correct JavaScript MIME types, so there is no second server and no CORS setup.
 
-**Terminal 2: the frontend (port 5600)**
+**Optional: separate frontend server**
 
-```bash
-cd frontend
-python -m http.server 5600
+```powershell
+python serve_frontend.py --port 5600
 ```
 
-Then open `http://127.0.0.1:5600/`, choose the dashboard page, and click **Run Risk Agent**. Make sure Ollama is running first, since it writes the SAR drafts and answers the chat.
+Then open `http://127.0.0.1:5600/`; the UI targets the API on port 8000. The separate server is useful if you prefer to edit frontend files independently, but it is no longer required.
 
-The dashboard analyzes `Data/processed/prod_sample_oct23_25.parquet` by default. The file is set in the dashboard page (`final_parquet_path`) and can be changed to any Parquet file with the same feature columns.
+Do **not** use plain `python -m http.server` on Windows: the registry can serve `.js` as `text/plain`, which prevents ES modules from loading. Do **not** use VS Code Live Server: it reloads when pipeline outputs change.
 
-Web runs use the same preparation and output code as the command line, so the results and saved files (`risk_scores.parquet`, `sar_reports.jsonl`, `summary.json`) are identical.
+Typical workflow:
+
+1. **Cases** — real account/day cases from the latest run, with search, status/tier/date/score filters and pagination.
+2. Open a case — score composition, thresholds, network signals, activity by currency and the selected case id in the URL.
+3. **Transactions** — bounded, filterable, paginated evidence with `TX-…` provenance references and source file.
+4. **Graph Explorer** — dark, bounded relationship graph; expand nodes, trace time-ordered money paths, detect time-ordered cycles, find shared counterparties and connected components. Every finding links back to transaction references.
+5. **AI Assistant** — case-aware chat using the existing Ollama tools. Tool calls, offline mode and elapsed time are shown.
+6. **Notes & findings** and **Timeline** — explicit-save notes, author/version history and append-only audit events.
+7. **SAR Reports** — evidence-grounded draft, narrative editing, missing-field panel, human review, approval and PDF/DOCX export. No external filing occurs.
+
+The API reads cases from the latest saved run by default. Use the `run` query parameter in the UI or `run_id` in the API for a historical run. If no run exists, the queue shows an actionable empty state rather than inventing a case.
+
+**How cases and evidence are identified**
+
+- **Case ID:** one case is one account on one day, written `CASE-{account}-{YYYYMMDD}` (for example `CASE-8201A5710-20221024`). The pipeline has no case ID of its own, so this ID is derived from `risk_scores.parquet`, where `(Account, graph_date)` is unique. The same account on two days gives two cases.
+- **Transaction reference:** the source data has no transaction ID, so each transaction gets a `TX-…` hash built from its timestamp, sender, receiver, amount paid, currency and payment format. It is a provenance aid, not an industry identifier.
+- **Currencies:** the data holds 15 currencies and has no exchange rates. Totals are always shown per currency, and one total is shown only when a case has a single currency.
+- **Account holders:** names come from the source record (`Entity_ID`, `Entity_Name`). They are not verified KYC data.
+- **Ground-truth labels:** `Is Laundering` and `Pattern Type` exist in the raw transactions but are never returned by the API or used in SAR drafts and AI context.
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /pipeline/analyze` | Runs the pipeline. Body: `{"final_parquet_path": "...", "date": "YYYY-MM-DD"}` (`date` is optional). |
-| `POST /chat` | Asks the local LLM questions about a flagged case. |
-| `GET /case/{case_id}` | Returns the stored details and SAR draft for a flagged account. |
+| `POST /pipeline/analyze` | Runs the pipeline. Body: `{"final_parquet_path": "...", "date": "YYYY-MM-DD"}`. Input must be under `FINDETECT_DATA_ROOT`. |
+| `GET /api/runs` | Lists saved runs. |
+| `GET /api/cases` | Paginated/filterable real case queue. |
+| `GET /api/cases/{case_id}` | Case overview, score explanation, transaction summary, SAR status. |
+| `GET /api/cases/{case_id}/transactions` | Paginated transaction evidence with per-currency aggregates. |
+| `GET /api/cases/{case_id}/graph` | Bounded case graph. |
+| `POST /api/cases/{case_id}/graph/paths` | Time-ordered money-flow paths. |
+| `POST /api/cases/{case_id}/graph/cycles` | Time-ordered directed cycles. |
+| `POST /api/cases/{case_id}/graph/shared-counterparties` | Shared-counterparty analysis. |
+| `POST /api/cases/{case_id}/graph/components` | Connected-component analysis. |
+| `POST /api/cases/{case_id}/chat` | Case-aware AI investigation with tool trace. |
+| `GET/POST /api/cases/{case_id}/notes` | Investigator notes and findings. |
+| `PATCH /api/notes/{note_id}` | Updated note with a new version. |
+| `PATCH /api/cases/{case_id}/status` | Case status change (explicit confirmation). |
+| `GET /api/cases/{case_id}/timeline` | Audit timeline. |
+| `GET/POST /api/cases/{case_id}/sar` | SAR draft list and generation. |
+| `PATCH /api/sar/drafts/{id}` | Edit draft, creating a new version. |
+| `POST /api/sar/drafts/{id}/submit-review` | Move draft to review. |
+| `POST /api/sar/drafts/{id}/approve` | Human approval with missing-field acknowledgement. |
+| `POST /api/sar/drafts/{id}/export?format=pdf\|docx` | Export the selected draft. |
+| `GET /api/meta` | Run, auth mode, model, limits, capabilities and policy-validation status. |
+
+Earlier endpoints are kept for compatibility: `POST /chat`, `GET /agent/tools`, `POST /agent/tool`, `POST /agent/review` and `GET /case/{account}`. New work should use the `/api/...` routes above.
 
 **Important notes**
 
-- **Serve the frontend with `python -m http.server`, not VS Code Live Server.** Live Server (port 5500) reloads the page whenever a file in the project changes. Each run writes files to `outputs/` and `.tmp/`, so the page would reload and the cards would disappear.
-- **Pick a free port.** Port 5600 is used in these instructions, but any free port works. Avoid 5500 (Live Server) and 8080 (often used by other software such as PostgreSQL).
-- If `uvicorn` is not installed, run `pip install fastapi uvicorn`.
+- Workflow state (case status, notes, SAR drafts, audit) is stored in local SQLite at `outputs/workflow/workflow.db`; scores and transactions remain Parquet source records.
+- The default security model is local-only. A token can be enabled with `FINDETECT_API_TOKEN`; the UI stores it only in `sessionStorage`. Full multi-user RBAC is not implemented in this release.
+- The API refuses pipeline inputs outside `FINDETECT_DATA_ROOT` and uses an explicit CORS allowlist (`FINDETECT_CORS_ORIGINS`).
+- Live Server (5500) and plain `python -m http.server` are not supported for this frontend. The recommended setup is the single server at `http://127.0.0.1:8000/ui/`; port 5600 is only for the optional separate frontend server.
+
+### 10. Use the agentic investigator
+
+The AI Assistant is case-aware: it receives the selected account/day and uses three read-only tools before answering:
+
+| Tool | What it returns |
+|---|---|
+| `get_account_scores(account_id, date)` | Final score, tier, model components, graph penalty, graph features, thresholds, score history. |
+| `get_transactions(account_id, date, direction, limit, min_amount)` | Directional flow totals by source currency, top counterparties and recent transactions. |
+| `get_graph_exposure(account_id, date)` | One-hop seed exposure with direction, two/three-hop counts, layering/mule indicators and penalty breakdown. |
+
+Every answer carries an evidence trace. With `FINDETECT_AGENT_NATIVE_TOOLS=0` the agent uses the JSON protocol and the prefetched evidence brief; this is the recommended setting for the 7B model on CPU.
+
+```powershell
+python agent_cli.py chat --case 100428660 --date 2022-10-23 `
+  --message "Why was this account flagged, and what is still unknown?"
+
+# No LLM: deterministic evidence memo
+python agent_cli.py chat --case 100428660 --date 2022-10-23 `
+  --message "Summarise" --no-llm
+```
+
+If Ollama is down or times out, the assistant shows a deterministic **offline evidence memo** instead of an error. The 3B model is faster but less reliable at reading directional amounts; 7B is recommended when accuracy matters.
+
+```powershell
+$env:FINDETECT_OLLAMA_TOOL_MODEL = "qwen2.5:3b-instruct"
+$env:FINDETECT_AGENT_NATIVE_TOOLS = "0"
+```
+
+The tool schemas, guardrails, fallbacks, configuration and performance notes are documented in [Agentic AML Investigator](AGENTIC_AI.md). Backend and frontend contract tests run without Ollama; real-data tests use the newest saved run:
+
+```powershell
+python -m pytest tests -q
+node tests/js/ui.test.mjs
+```
 
 ### Output
 
@@ -295,7 +385,7 @@ Results are written to `outputs/FINDETECT_Pipeline_Output/<run>/`, where `<run>`
 | File | Content |
 |---|---|
 | `risk_scores.parquet` | Risk score, risk label, investigation flag and tier for every account on that day. |
-| `sar_reports.jsonl` | LLM-drafted SAR reports (one JSON record per line) for the highest-risk cases. |
+| `sar_reports.jsonl` | Legacy pipeline template drafts for the top 25 alerts. The investigator workspace creates its own versioned, evidence-grounded SAR drafts in SQLite. |
 | `summary.json` | Run summary: number of account/days, investigation cases, high-risk seeds and directly exposed receivers. |
 
 ---
@@ -379,6 +469,32 @@ python run_full_pipeline.py --date 2022-09-01
 
 The Ollama model is `qwen2.5` by default, and Ollama listens on `http://localhost:11434`. Because the LLM runs locally, no API key is required. If you add other secrets later, keep them in environment variables or a local `.env` file excluded through `.gitignore`.
 
+Agentic investigator settings:
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `FINDETECT_AGENT_ENABLED` | Enable tool-using chat (`0` restores the original single-shot chat). | `1` |
+| `FINDETECT_OLLAMA_TOOL_MODEL` | Model used for agent calls; a 3B model is faster on CPU. | `qwen2.5` |
+| `FINDETECT_AGENT_MAX_STEPS` | Tool-calling rounds before a forced answer. | `5` |
+| `FINDETECT_AGENT_NATIVE_TOOLS` | Ollama native tool calling; set `0` on slow CPU machines. | `1` |
+| `FINDETECT_AGENT_NUM_CTX` | Agent context window (Ollama's qwen2.5 default of 4096 is too small). | `8192` |
+| `FINDETECT_AGENT_OLLAMA_TIMEOUT` | Per-call timeout in seconds. | `300` |
+| `FINDETECT_AGENT_WARMUP` | Load the model in the background at API startup. | `1` |
+| `FINDETECT_AGENT_TX_LIMIT`, `FINDETECT_AGENT_TX_MAX_LIMIT` | Transaction rows per tool call. | `25`, `100` |
+
+Investigator workflow and security settings:
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `FINDETECT_WORKFLOW_DB` | SQLite workflow database (case state, notes, SAR, audit). | `outputs/workflow/workflow.db` |
+| `FINDETECT_DATA_ROOT` | Only pipeline inputs inside this directory are accepted. | `Data/processed` |
+| `FINDETECT_API_TOKEN` | Optional bearer token for every data endpoint; empty means local-only. | empty |
+| `FINDETECT_INVESTIGATOR_ID` | Default investigator attribution when no header is supplied. | `local-investigator` |
+| `FINDETECT_CORS_ORIGINS` | Comma-separated allowed origins. | local ports 5600/8000 |
+| `FINDETECT_GRAPH_MAX_NODES`, `..._EDGES`, `..._DEPTH` | Graph bounding limits. | `100`, `300`, `2` |
+| `FINDETECT_GRAPH_MAX_PATHS`, `..._CYCLES`, `..._VISITED` | Analysis bounds. | `20`, `20`, `1000` |
+| `FINDETECT_SAR_MAX_EVIDENCE_ROWS` | Transaction evidence stored in a SAR draft. | `50` |
+
 ---
 
 ## Data & Privacy
@@ -386,9 +502,9 @@ The Ollama model is `qwen2.5` by default, and Ollama listens on `http://localhos
 Financial data is highly sensitive. When deploying FINDETECT:
 
 - Run it inside your organization's secure environment; data is stored locally in DuckDB/Parquet files.
-- The LLM explanation step runs **locally through [Ollama](https://ollama.com)**, so transaction details are not sent to an external API or third-party service. This makes FINDETECT suitable for environments with strict data-residency requirements.
-- The dashboard API is intended for local use. It accepts requests from any origin and any file path under your control; before exposing it on a network, restrict the allowed origins and input folders, and add authentication.
-- Do not commit real customer data to the repository. Use `make_sample.py` for demos and testing.
+- The LLM explanation step runs **locally through [Ollama](https://ollama.com)**, so transaction details are not sent to an external API or third-party service. This makes FINDETECT suitable for environments with strict data-residency requirements. The agent's evidence tools read local Parquet/DuckDB data; their results are only sent to the local Ollama process.
+- The API is local-first. It now enforces an optional bearer token, a CORS allowlist and a data-root restriction, but full multi-user role-based access is not implemented. Bind it to localhost unless you add an identity-aware gateway.
+- Do not commit real customer data or the workflow database to the repository. `outputs/` and `Data/` are ignored.
 - Follow applicable regulations for your jurisdiction (for example GDPR or local AML/KYC requirements).
 
 ---
@@ -397,11 +513,18 @@ Financial data is highly sensitive. When deploying FINDETECT:
 
 - FINDETECT is a **decision-support tool**. It does not replace human compliance analysts or make final determinations of illicit activity.
 - Model performance depends on data quality and how closely the data matches the training data. Results should be validated on your own data before operational use.
-- SAR drafts are generated for the top 25 highest-risk cases per run by default, a limit chosen for local hardware. Production deployments with more compute can raise it so that every flagged case gets a draft. All flagged cases are still saved in `risk_scores.parquet`.
-- LLM-generated explanations are meant to assist review and may contain inaccuracies; they should not be treated as evidence.
+- The pipeline still emits legacy SAR templates for the top 25 alerts per run. The investigator workspace can generate a new evidence-grounded draft for any selected case; it does not replace the historical `sar_reports.jsonl`.
+- LLM-generated explanations are meant to assist review and may contain inaccuracies; they should not be treated as evidence or approval.
+- The agentic investigator only sees the pipeline's saved scores, transactions and graph features through its three tools. It cannot see KYC, watchlists or external documents, and it does not make SAR decisions.
+- Transaction references are deterministic `TX-…` hashes because the source dataset has no native transaction id. They are provenance aids, not industry transaction identifiers.
+- Policy retrieval/RAG, regulatory validation and external regulator filing are **not implemented**. The SAR page labels policy validation as unavailable and never fabricates citations.
+- Multi-user roles, case assignment permissions and authenticated identity are not implemented; the optional token is a single shared secret. Do not expose the API to untrusted users.
 - The risk score is a ranking score. It is not a calibrated probability of laundering, so do not read a score of 0.4 as a 40% chance.
 - Thresholds should be tuned and approved by your compliance team, on a window that is separate from the one used to report results.
 - Results were measured on one three-day window of one dataset. Performance on other periods may differ.
+- The legacy `sar_reports.jsonl` drafts contain no transaction evidence and always say no direct graph exposure was recorded, because the pipeline passes an empty evidence table to the template. They also write amounts as "SAR" regardless of the real currency. Use the workspace SAR drafts instead.
+- Browser behavior is covered by headless Chrome smoke checks and JavaScript unit tests, not by an automated browser test suite (Playwright could not be installed).
+- The risk score is explained by its components (XGBoost, autoencoder, behavioral, graph penalty). No per-feature explanation such as SHAP is produced.
 
 ---
 

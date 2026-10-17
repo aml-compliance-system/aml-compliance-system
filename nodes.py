@@ -518,10 +518,10 @@ def graph_context_node(state: dict) -> dict:
 
     DIRECT_PENALTY = config.GRAPH_RECEIVING_PENALTY
     INDIRECT_PENALTY = config.GRAPH_INDIRECT_PENALTY
-    TERTIARY_PENALTY = INDIRECT_PENALTY * 0.5
+    TERTIARY_PENALTY = INDIRECT_PENALTY * config.TERTIARY_PENALTY_FACTOR
 
-    BIDIR_PENALTY = 0.08   # Each bidirectional relationship adds this
-    FAN_BOOST = 0.12       # Fan pattern adds up to this much
+    BIDIR_PENALTY = config.BIDIR_PENALTY     # Each bidirectional relationship adds this
+    FAN_BOOST = config.FAN_BOOST             # Fan pattern adds up to this much
 
     account_results["graph_penalty"] = (
         (account_results["hop1_count"] * DIRECT_PENALTY * account_results["volume_factor"])
@@ -529,7 +529,7 @@ def graph_context_node(state: dict) -> dict:
         + (account_results["hop3_count"] * TERTIARY_PENALTY)
         + (account_results["bidir_count"] * BIDIR_PENALTY)
         + (account_results["fan_score"] * FAN_BOOST)
-    ).clip(upper=0.75)
+    ).clip(upper=config.GRAPH_PENALTY_CAP)
 
     # Pattern-based base_risk boost
     pattern_boost = (
