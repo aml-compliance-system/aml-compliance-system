@@ -8,18 +8,19 @@
 
 1. [Overview](#overview)
 2. [Key Features](#key-features)
-3. [How It Works](#how-it-works)
-4. [Project Structure](#project-structure)
-5. [Requirements](#requirements)
-6. [Installation](#installation)
-7. [Usage](#usage)
-8. [Evaluation Results](#evaluation-results)
-9. [Configuration](#configuration)
-10. [Data & Privacy](#data--privacy)
-11. [Limitations & Disclaimer](#limitations--disclaimer)
-12. [Contributing](#contributing)
-13. [License](#license)
-14. [Contact](#contact)
+3. [Screenshots](#screenshots)
+4. [How It Works](#how-it-works)
+5. [Project Structure](#project-structure)
+6. [Requirements](#requirements)
+7. [Installation](#installation)
+8. [Usage](#usage)
+9. [Evaluation Results](#evaluation-results)
+10. [Configuration](#configuration)
+11. [Data & Privacy](#data--privacy)
+12. [Limitations & Disclaimer](#limitations--disclaimer)
+13. [Contributing](#contributing)
+14. [License](#license)
+15. [Contact](#contact)
 
 ---
 
@@ -56,6 +57,42 @@ The pipeline is orchestrated with [LangGraph](https://github.com/langchain-ai/la
 - **SAR workflow**: evidence-grounded draft, editing, missing-field validation, human review/approval and PDF/DOCX export. No external filing.
 - **Agentic investigator**: the chat LLM can call three read-only evidence tools (`get_account_scores`, `get_transactions`, `get_graph_exposure`), decide what to inspect, and answer with a trace of the evidence it used. See [Agentic AML Investigator](AGENTIC_AI.md).
 - **Local analytical storage** using DuckDB and Parquet for fast processing without a separate database server.
+
+---
+
+## Screenshots
+
+The investigator workspace, shown on a real run of the sample dataset (account/day cases from `prod_sample_oct23_25`).
+
+### Case queue
+
+![Case queue](docs/screenshots/case.jpg)
+
+*Every flagged account/day from the latest pipeline run, with search, status, tier, date and score filters. Each row shows the case ID, holder, risk label, score, status and network signals (seed, 1-hop exposure, bidirectional flows).*
+
+### Case workspace
+
+![Case workspace](docs/screenshots/case-overview.jpg)
+
+*One case in detail: final risk score against the investigation threshold, base ML risk, graph penalty, transaction count by currency, SAR drafts, and the score composition with the tier thresholds. Tabs lead to transactions, notes and the timeline.*
+
+### Graph explorer
+
+![Graph explorer](docs/screenshots/graph.jpg)
+
+*Bounded transaction graph around the selected account. Nodes can be expanded, and the side panel traces time-ordered money paths, cycles, shared counterparties and connected components. Findings are leads, not proof of laundering.*
+
+### AI investigation assistant
+
+![AI investigation assistant](docs/screenshots/assistant.jpg)
+
+*Case-aware chat running on a local model. Answers are grounded in the three read-only evidence tools, and each answer shows which tools it used. If the model is unavailable, an offline evidence memo is shown instead.*
+
+### SAR draft and review
+
+![SAR draft and review](docs/screenshots/sar.jpg)
+
+*Evidence-grounded draft with an editable narrative, a list of missing information, activity by currency and transaction evidence. A draft moves from draft to review to approval by a human, with PDF and DOCX export. Nothing is filed externally.*
 
 ---
 
@@ -107,6 +144,7 @@ FINDETECT/
 │   └── assets/                      # Local CSS/JS modules (no build step)
 ├── models/                          # Trained models (incl. autoencoder_final64/ and meta_learner_calibrated.pkl)
 ├── Data/processed/                  # 64 input Parquet files: block_d_numerical_bucket_000 to 063 (not committed to Git)
+├── docs/screenshots/                # UI screenshots used in this README
 ├── outputs/                         # Pipeline results and local workflow DB (generated)
 ├── AMLPipelineState.py              # Shared pipeline state (with merge_dicts reducer)
 ├── api_cases.py                     # Cases, transactions, case chat and meta routes
